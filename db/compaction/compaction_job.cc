@@ -1029,13 +1029,16 @@ Status CompactionJob::Install(bool* compaction_released) {
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::Install:AfterUpdateCompactionJobStats", job_stats_);
 
+  auto smallest_key_str = compact_->compaction->GetSmallestUserKey().ToString();
+  auto largest_key_str = compact_->compaction->GetLargestUserKey().ToString();
   auto stream = event_logger_->LogToBuffer(log_buffer_, 8192);
   stream << "job" << job_id_ << "event" << "compaction_finished"
          << "compaction_time_micros" << stats.micros
          << "compaction_time_cpu_micros" << stats.cpu_micros << "output_level"
          << compact_->compaction->output_level() << "num_output_files"
          << stats.num_output_files << "total_output_size"
-         << stats.bytes_written;
+         << stats.bytes_written << "smallest_key" << smallest_key_str
+         << "largest_key" << smallest_key_str;
 
   if (stats.num_output_files_blob > 0) {
     stream << "num_blob_output_files" << stats.num_output_files_blob
