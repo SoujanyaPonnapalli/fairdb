@@ -865,6 +865,7 @@ Status FlushJob::WriteLevel0Table() {
   // Note that here we treat flush as level 0 compaction in internal stats
   InternalStats::CompactionStats flush_stats(CompactionReason::kFlush,
                                              1 /* count**/);
+  uint64_t total_flush_data_size = 0;
   {
     auto write_hint = base_->storage_info()->CalculateSSTWriteHint(
         /*level=*/0, db_options_.calculate_sst_write_lifetime_hint_set);
@@ -937,6 +938,7 @@ Status FlushJob::WriteLevel0Table() {
                          << "num_range_deletes" << total_num_range_deletes
                          << "flush_reason"
                          << GetFlushReasonString(flush_reason_);
+    total_flush_data_size = total_data_size;
 
     {
       ScopedArenaPtr<InternalIterator> iter(
@@ -1107,11 +1109,16 @@ Status FlushJob::WriteLevel0Table() {
   flush_stats.micros = micros;
   flush_stats.cpu_micros = cpu_micros;
 
+  // ROCKS_LOG_INFO(db_options_.info_log,
+  //                "[%s] [JOB %d] Flush lasted %" PRIu64
+  //                " microseconds, and %" PRIu64 " cpu microseconds.\n",
+  //                cfd_->GetName().c_str(), job_context_->job_id, micros,
+  //                cpu_micros);
   ROCKS_LOG_INFO(db_options_.info_log,
-                 "[%s] [JOB %d] Flush lasted %" PRIu64
-                 " microseconds, and %" PRIu64 " cpu microseconds.\n",
+                 "[%s] [JOB %d] Flush: %" PRIu64
+                 " microseconds, %" PRIu64 " cpu microseconds, %" PRIu64 " bytes\n",
                  cfd_->GetName().c_str(), job_context_->job_id, micros,
-                 cpu_micros);
+                 cpu_micros, total_flush_data_size);
 
   if (has_output) {
     flush_stats.bytes_written = meta_.fd.GetFileSize();
