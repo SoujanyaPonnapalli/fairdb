@@ -873,6 +873,7 @@ set(SOURCES
         trace_replay/trace_record_result.cc
         trace_replay/trace_record.cc
         trace_replay/trace_replay.cc
+        util/tg_thread_local.cc
         util/async_file_reader.cc
         util/auto_skip_compressor.cc
         util/cleanable.cc
