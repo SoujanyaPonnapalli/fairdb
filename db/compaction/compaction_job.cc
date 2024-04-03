@@ -676,19 +676,23 @@ int TG_StringKeyToIntKey(std::string key) {
     std::string numPart = key.substr(4);
     return std::stoi(numPart);
   } catch (const std::exception& e) {
-      return -1;
+      return -2;
   }
 }
 
 void TG_SetThreadMetadata(std::string key) {
   auto& thread_metadata = TG_GetThreadMetadata();
   int key_num = TG_StringKeyToIntKey(key);
-  if (key_num == -1) {
-    thread_metadata.client_id = -1;
+  if (key_num == -2) {
+    thread_metadata.client_id = -2;
     return;
   }
 
   int client_id = key_num / (6250000 / 4);
+
+  // TODO(tgriggs): remove this
+  client_id = 1 + client_id;
+
   thread_metadata.client_id = client_id;
   return;
 }
@@ -706,8 +710,12 @@ Status CompactionJob::Run() {
   // }
 
   TG_SetThreadMetadata(compact_->compaction->GetSmallestUserKey().ToString());
+  auto smallest_key = TG_StringKeyToIntKey(compact_->compaction->GetSmallestUserKey().ToString()) / (6250000 / 4);;
+  auto largest_key = TG_StringKeyToIntKey(compact_->compaction->GetLargestUserKey().ToString()) / (6250000 / 4);;
+
+  std::cout << "[TGRIGGS_LOG] level: " << compact_->compaction->output_level() << std::endl;
   std::cout << "[TGRIGGS_LOG] start,end: " << compact_->compaction->GetSmallestUserKey().ToString() << ", " << compact_->compaction->GetLargestUserKey().ToString() << std::endl;
-  std::cout << "[TGRIGGS_LOG] compaction client_id: " << TG_GetThreadMetadata().client_id << std::endl;
+  std::cout << "[TGRIGGS_LOG] compaction client_id: " << smallest_key << ", " << largest_key << std::endl;
 
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
@@ -1419,8 +1427,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       db_options_.info_log, full_history_ts_low, preserve_seqno_after_);
   c_iter->SeekToFirst();
 
-  std::cout << "[TGRIGGS_LOG] c_iter user_key: " << c_iter->user_key().ToString() << std::endl;;
-
   const auto& c_iter_stats = c_iter->iter_stats();
 
   // define the open and close functions for the compaction files, which will be
@@ -1445,6 +1451,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       "CompactionJob::ProcessKeyValueCompaction()::Processing",
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
   uint64_t last_cpu_micros = prev_cpu_micros;
+  int client_counts[4] = {0,0,0,0};
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
     // Invariant: c_iter.status() is guaranteed to be OK if c_iter->Valid()
     // returns true.
@@ -1497,6 +1504,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     // and `close_file_func`.
     // TODO: it would be better to have the compaction file open/close moved
     // into `CompactionOutputs` which has the output file information.
+    TG_SetThreadMetadata(c_iter->user_key().ToString());
     status = sub_compact->AddToOutput(*c_iter, use_proximal_output,
                                       open_file_func, close_file_func);
     if (!status.ok()) {
@@ -1506,7 +1514,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     TEST_SYNC_POINT_CALLBACK("CompactionJob::Run():PausingManualCompaction:2",
                              static_cast<void*>(const_cast<std::atomic<bool>*>(
                                  &manual_compaction_canceled_)));
+
+    // TODO(tgriggs): This is where rate limiter requests are triggered
     c_iter->Next();
+    ++client_counts[(TG_StringKeyToIntKey(c_iter->user_key().ToString()) / (6250000 / 4))];
+    // std::cout << "[TGRIGGS_LOG] c_iter client: " << (TG_StringKeyToIntKey(c_iter->user_key().ToString()) / (6250000 / 4)) << std::endl;;
     if (c_iter->status().IsManualCompactionPaused()) {
       break;
     }
@@ -1520,6 +1532,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
 #endif  // NDEBUG
   }
+  std::cout << "[TGRIGGS_LOG] client counts: ";
+  for (int i = 0; i < 4; ++i) {
+    std::cout << client_counts[i] << ", ";
+  }
+  std::cout << std::endl;
 
   // This number may not be accurate when CompactionIterator was created
   // with `must_count_input_entries=false`.
@@ -1586,6 +1603,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // create a new output file.
   status = sub_compact->CloseCompactionFiles(status, open_file_func,
                                              close_file_func);
+
+  auto& thread_metadata = TG_GetThreadMetadata();
+  thread_metadata.client_id = 0;
 
   if (blob_file_builder) {
     if (status.ok()) {
