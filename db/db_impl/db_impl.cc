@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/attribute_group_iterator_impl.h"
@@ -5043,6 +5044,23 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
     cfd->current()->GetColumnFamilyMetaData(cf_meta);
+  }
+}
+
+void DBImpl::GetCFMemTableStats() {
+  InstrumentedMutexLock l(&mutex_);
+  for (auto cfd : *(versions_->GetColumnFamilySet())) {
+    {
+      std::cout << "memtables," << cfd->GetName() << "," 
+        << cfd->imm()->NumNotFlushed() + 1
+        << "," << (cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage()) / (1024*1024) << "MB\n";
+
+      // cfd->GetName();
+      // cfd->mem().size() + cfd->imm()->NumNotFlushed();
+
+      // cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage();
+      // cfd->current()->GetColumnFamilyMetaData(&metadata->back());
+    }
   }
 }
 

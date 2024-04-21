@@ -1897,6 +1897,8 @@ class DB {
     GetColumnFamilyMetaData(DefaultColumnFamily(), metadata);
   }
 
+  virtual void GetCFMemTableStats() {};
+
   // Obtains the LSM-tree meta data of all column families of the DB, including
   // metadata for each live table (SST) file and each blob file in the DB.
   virtual void GetAllColumnFamilyMetaData(
