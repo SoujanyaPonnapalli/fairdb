@@ -225,6 +225,11 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       blob_callback_(immutable_db_options_.sst_file_manager.get(), &mutex_,
                      &error_handler_, &event_logger_,
                      immutable_db_options_.listeners, dbname_) {
+
+  for (int i = 0; i < 2; ++i) {
+    write_controllers_.push_back(std::make_shared<WriteController>(mutable_db_options_.delayed_write_rate));
+  }
+
   // !batch_per_trx_ implies seq_per_batch_ because it is only unset for
   // WriteUnprepared, which should use seq_per_batch_.
   assert(batch_per_txn_ || seq_per_batch_);
@@ -252,15 +257,17 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   periodic_task_functions_.emplace(PeriodicTaskType::kFlushInfoLog,
                                    [this]() { this->FlushInfoLog(); });
   periodic_task_functions_.emplace(
-      PeriodicTaskType::kRecordSeqnoTime,
-      [this]() { this->RecordSeqnoToTimeMapping(); });
-  periodic_task_functions_.emplace(
-      PeriodicTaskType::kTriggerCompaction,
-      [this]() { this->TriggerPeriodicCompaction(); });
+    PeriodicTaskType::kRecordSeqnoTime, [this]() {
+      this->RecordSeqnoToTimeMapping(/*populate_historical_seconds=*/0);
+    });
+    PeriodicTaskType::kTriggerCompaction,
+    [this]() { this->TriggerPeriodicCompaction(); });
 
+
+  // TODO(tgriggs): handle this write_controller_
   versions_.reset(new VersionSet(
       dbname_, &immutable_db_options_, file_options_, table_cache_.get(),
-      write_buffer_manager_, &write_controller_, &block_cache_tracer_,
+      write_buffer_manager_, &write_controller_, write_controllers_, &block_cache_tracer_,
       io_tracer_, db_id_, db_session_id_, options.daily_offpeak_time_utc,
       &error_handler_, read_only));
   column_family_memtables_.reset(
@@ -1404,6 +1411,9 @@ Status DBImpl::SetDBOptions(
 
       write_controller_.set_max_delayed_write_rate(
           new_options.delayed_write_rate);
+      for (auto& wc : write_controllers_) {
+        wc->set_max_delayed_write_rate( new_options.delayed_write_rate);
+      }
       table_cache_.get()->SetCapacity(new_options.max_open_files == -1
                                           ? TableCache::kInfiniteCapacity
                                           : new_options.max_open_files - 10);
