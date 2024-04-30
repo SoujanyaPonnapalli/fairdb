@@ -628,6 +628,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     // with the other thread
 
     // PreprocessWrite does its own perf timing.
+    // TODO(tgriggs): This is where delays will occur
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
     status = PreprocessWrite(write_options, &wal_context, &write_context);
@@ -1552,6 +1553,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     // might happen for smaller writes but larger writes can go through.
     // Can optimize it if it is an issue.
     InstrumentedMutexLock l(&mutex_);
+    // TODO(tgriggs): here is the delay.
     status = DelayWrite(last_batch_group_size_, write_thread_, write_options);
     PERF_TIMER_START(write_pre_and_post_process_time);
   }
