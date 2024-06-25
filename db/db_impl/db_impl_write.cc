@@ -654,7 +654,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   }
 
   size_t num_cfs = 2;
-  for (int i = 0; i < num_cfs; ++i) {
+  for (size_t i = 0; i < num_cfs; ++i) {
     last_batch_sizes_[i] = 0;
   }
   
