@@ -286,6 +286,16 @@ Status DBImpl::FlushMemTableToOutputFile(
   // Note that flush_job.Run will unlock and lock the db_mutex,
   // and EventListener callback will be called when the db_mutex
   // is unlocked by the current thread.
+
+  // TODO(tgriggs): Super hacky. Update code to use cfd->GetID()
+  auto& thread_metadata = TG_GetThreadMetadata();
+  if (cfd->GetName() == "default") {
+    thread_metadata.client_id = 1;
+  } else if (cfd->GetName() == "cf2") {
+    thread_metadata.client_id = 2;
+  } else {
+    thread_metadata.client_id = -3;
+  }
   if (s.ok()) {
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
                       &switched_to_mempurge, &skip_set_bg_error,
@@ -356,6 +366,10 @@ Status DBImpl::FlushMemTableToOutputFile(
       error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
     }
   }
+
+  // Reset the thread metadata.
+  thread_metadata.client_id = 0;
+
   // If flush ran smoothly and no mempurge happened
   // install new SST file path.
   if (s.ok() && (!switched_to_mempurge)) {
@@ -3163,8 +3177,6 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
                                bool* flush_rescheduled_to_retain_udt,
                                Env::Priority thread_pri) {
   mutex_.AssertHeld();
-  auto& thread_metadata = TG_GetThreadMetadata();
-  thread_metadata.client_id = -1;
 
   Status status;
   *reason = FlushReason::kOthers;
@@ -3306,8 +3318,6 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
     cfd->UnrefAndTryDelete();
   }
 
-  // Reset
-  thread_metadata.client_id = 0;
   return status;
 }
 
