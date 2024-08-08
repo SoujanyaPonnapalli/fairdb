@@ -1377,6 +1377,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     input = trim_history_iter.get();
   }
 
+  // TODO(tgriggs): first read location in compaction
   input->SeekToFirst();
 
   AutoThreadOperationStageUpdater stage_updater(
