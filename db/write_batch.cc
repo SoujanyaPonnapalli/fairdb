@@ -2261,9 +2261,9 @@ class MemTableInserter : public WriteBatch::Handler {
 
     auto& thread_metadata = TG_GetThreadMetadata();
     if (cf_name.empty()) {
-      thread_metadata.client_id = -2;
+      thread_metadata.client_id = -1;
     } else if (cf_name == "default") {
-      thread_metadata.client_id = 1;
+      thread_metadata.client_id = 0;
     } else {
       thread_metadata.client_id = std::stoi(cf_name.substr(2));       
     }
@@ -2382,7 +2382,7 @@ class MemTableInserter : public WriteBatch::Handler {
       ret_status =
           rebuild_txn_op(rebuilding_trx_, column_family_id, key, value);
     }
-    thread_metadata.client_id = 0;
+    thread_metadata.client_id = -1;
     return ret_status;
   }
 
