@@ -2513,12 +2513,22 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   TEST_SYNC_POINT_CALLBACK("DBImpl::ScheduleFlushes:PreSwitchMemtable",
                            nullptr);
   for (auto& cfd : cfds) {
+
+    auto& thread_metadata = TG_GetThreadMetadata();
+    if (cfd->GetName().empty()) {
+      thread_metadata.client_id = -1;
+    } else if (cfd->GetName() == "default") {
+      thread_metadata.client_id = 0;
+    } else {
+      thread_metadata.client_id = std::stoi(cfd->GetName().substr(2));       
+    }
     if (status.ok() && !cfd->mem()->IsEmpty()) {
       status = SwitchMemtable(cfd, context);
     }
     if (cfd->UnrefAndTryDelete()) {
       cfd = nullptr;
     }
+    thread_metadata.client_id = -1;
   }
 
   if (two_write_queues_) {

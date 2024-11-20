@@ -52,6 +52,12 @@ WriteBufferManager::WriteBufferManager(size_t buffer_size,
         CacheReservationManagerImpl<CacheEntryRole::kWriteBuffer>>(
         cache, true /* delayed_decrease */);
   }
+
+  mt_log_file_.open("logs/memtable_stats.txt", std::ios::out | std::ios::trunc);
+  // Ensure log file is open and ready for use
+  if (!mt_log_file_.is_open()) {
+    throw std::ios_base::failure("Failed to open log/memtable_stats.txt");
+  }
 }
 
 WriteBufferManager::~WriteBufferManager() {
@@ -61,6 +67,9 @@ WriteBufferManager::~WriteBufferManager() {
     assert(queue.empty());
   }
 #endif
+  if (mt_log_file_.is_open()) {
+    mt_log_file_.close();
+  }
 }
 
 std::size_t WriteBufferManager::dummy_entries_in_cache_usage() const {
@@ -95,12 +104,23 @@ void PrintStackTrace() {
     free(symbollist);  // `backtrace_symbols` uses malloc internally
 }
 
+bool WriteBufferManager::ShouldStall(int client_id) const {
+  if (client_id < 0) {
+    std::cout << "[FAIRDB_LOG] Unaccounted ShouldStall " << client_id << std::endl;
+    return false;
+  }
+  if (!allow_stall_.load(std::memory_order_relaxed) || !enabled()) {
+    return false;
+  }
+
+  return IsStallActive(client_id) || IsStallThresholdExceeded(client_id);
+}
+
 void WriteBufferManager::SetPerClientBufferSize(int client_id, size_t buffer_size) {
   per_client_buffer_size_[client_id] = buffer_size;
 }
 
 void WriteBufferManager::ReserveMem(size_t mem) {
-  // PrintStackTrace();
   int client_id = TG_GetThreadMetadata().client_id;
   if (client_id < 0) {
     std::cout << "[FAIRDB_LOG] Unaccounted ReserveMem " << client_id << std::endl;
@@ -115,7 +135,7 @@ void WriteBufferManager::ReserveMem(size_t mem) {
   if (enabled()) {
     memory_active_.fetch_add(mem, std::memory_order_relaxed);
   }
-  // std::cout << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",res," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
+  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",res," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
 }
 
 // Should only be called from write thread
@@ -159,7 +179,7 @@ void WriteBufferManager::FreeMem(size_t mem) {
     memory_used_.fetch_sub(mem, std::memory_order_relaxed);
     per_client_memory_used_[client_id].fetch_sub(mem, std::memory_order_relaxed);
   }
-  // std::cout << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",free," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
+  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",free," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
 
   // Check if stall is active and can be ended.
   MaybeEndWriteStall();

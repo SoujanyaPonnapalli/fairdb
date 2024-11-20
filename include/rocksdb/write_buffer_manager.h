@@ -141,17 +141,7 @@ bool ShouldFlush() const {
   // WriteBufferManager instance creation.
   //
   // Should only be called by RocksDB internally.
-  bool ShouldStall(int client_id) const {
-    if (client_id < 0) {
-      std::cout << "[FAIRDB_LOG] Unaccounted ShouldStall " << client_id << std::endl;
-      return false;
-    }
-    if (!allow_stall_.load(std::memory_order_relaxed) || !enabled()) {
-      return false;
-    }
-
-  return IsStallActive(client_id) || IsStallThresholdExceeded(client_id);
-}
+  bool ShouldStall(int client_id) const;
 
   // Returns true if stall is active for the given client.
   bool IsStallActive(int client_id) const {
@@ -203,6 +193,9 @@ bool ShouldFlush() const {
   // Value should only be changed by BeginWriteStall() and MaybeEndWriteStall()
   // while holding mu_, but it can be read without a lock.
   std::vector<std::atomic<bool>> per_client_stall_active_;
+
+  std::ofstream mt_log_file_;
+
 
   void ReserveMemWithCache(size_t mem);
   void FreeMemWithCache(size_t mem);
