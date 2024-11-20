@@ -684,18 +684,9 @@ int TG_StringKeyToIntKey(std::string key) {
 }
 
 void TG_SetThreadMetadata(std::string key) {
+  (void) key;
   auto& thread_metadata = TG_GetThreadMetadata();
-  int key_num = TG_StringKeyToIntKey(key);
-  if (key_num == -2) {
-    thread_metadata.client_id = -1;
-    return;
-  }
-
-  // TODO(tgriggs): update Client ID determination
-  // int client_id = key_num / (6250000 / 4) + 1;
-
-  thread_metadata.client_id = -1;
-  return;
+  thread_metadata.client_id = -2;
 }
 
 Status CompactionJob::Run() {

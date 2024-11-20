@@ -263,8 +263,14 @@ void MultiTenantRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
   // Extract client ID from thread-local metadata.
   int client_id = TG_GetThreadMetadata().client_id;
 
+  if (client_id == -2) {
+    compaction_calls_++;
+    compaction_bytes_ += bytes;
+    return;
+  }
   if (client_id < 0) {
-    std::cout << "[FAIRDB_LOG] Call to Request() has error in client id assignment: " << client_id << std::endl;
+    // std::cout << "[FAIRDB_LOG] Call to Request() has error in client id assignment: " << client_id << std::endl;
+    // TGprintStackTrace();
     unassigned_calls_++;
     unassigned_bytes_ += bytes;
     return;
@@ -285,6 +291,7 @@ void MultiTenantRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
       std::cout << "Client " << i << ": " << calls_per_client_[i] << " calls, " << (bytes_per_client_[i]/1024/1024) << " MB\n";
     }
     std::cout << "Unassigned: " << unassigned_calls_ << " calls, " << (unassigned_bytes_/1024/1024) << " MB.\n";
+    std::cout << "Compaction: " << compaction_calls_ << " calls, " << (compaction_bytes_/1024/1024) << " MB.\n";
   }
 
   assert(bytes <= GetSingleBurstBytes(client_id));

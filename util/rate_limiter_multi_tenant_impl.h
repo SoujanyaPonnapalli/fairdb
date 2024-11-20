@@ -162,6 +162,8 @@ class MultiTenantRateLimiter : public RateLimiter {
   std::vector<int64_t> bytes_per_client_;
   int64_t unassigned_calls_ = 0;
   int64_t unassigned_bytes_ = 0;
+  int64_t compaction_calls_ = 0;
+  int64_t compaction_bytes_ = 0;
   int total_calls_;
   RateLimiter* read_rate_limiter_ = nullptr;
   RateLimiter::Mode mode_;
