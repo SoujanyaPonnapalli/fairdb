@@ -136,6 +136,7 @@ void WriteBufferManager::ReserveMem(size_t mem) {
     memory_active_.fetch_add(mem, std::memory_order_relaxed);
   }
   mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",res," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
+  // mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",all,res," << mem << "," << memory_used_.load(std::memory_order_relaxed) << std::endl;
 }
 
 // Should only be called from write thread

@@ -19,6 +19,7 @@
 #include <mutex>
 #include <vector>
 #include <iostream>
+#include <fstream>
 #include "rocksdb/cache.h"
 #include "rocksdb/tg_thread_local.h"
 
