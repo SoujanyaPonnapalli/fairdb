@@ -21,6 +21,9 @@
 #include <iostream>
 #include <cstdlib>
 #include <chrono>
+#include <atomic>
+#include <vector>
+#include <mutex>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -37,11 +40,14 @@ WriteBufferManager::WriteBufferManager(size_t buffer_size,
       cache_res_mgr_(nullptr),
       per_client_queue_(num_clients),
       allow_stall_(allow_stall),
-      per_client_stall_active_(num_clients) {
-  // Initialize per-client memory usage and stall flags
+      per_client_stall_active_(num_clients),
+      per_client_stall_count_(num_clients),  // Initialize stall count for clients
+      total_stall_count_(0) {  // Initialize total stalls
+  // Initialize per-client memory usage, stall flags, and stall counts
   for (size_t i = 0; i < num_clients; ++i) {
     per_client_memory_used_[i] = 0;
     per_client_stall_active_[i] = false;
+    per_client_stall_count_[i] = 0;
   }
 
   if (cache) {
@@ -136,12 +142,10 @@ void WriteBufferManager::ReserveMem(size_t mem) {
     memory_active_.fetch_add(mem, std::memory_order_relaxed);
   }
   mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",res," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
-  // mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",all,res," << mem << "," << memory_used_.load(std::memory_order_relaxed) << std::endl;
 }
 
 // Should only be called from write thread
 void WriteBufferManager::ReserveMemWithCache(size_t mem) {
-  // std::cout << "[FAIRDB_LOG] Surprise!! ReserveMemWithCache() called.\n";
   assert(cache_res_mgr_ != nullptr);
   // Use a mutex to protect various data structures. Can be optimized to a
   // lock-free solution if it ends up with a performance bottleneck.
@@ -160,8 +164,6 @@ void WriteBufferManager::ReserveMemWithCache(size_t mem) {
 }
 
 void WriteBufferManager::ScheduleFreeMem(size_t mem) {
-  // int client_id = TG_GetThreadMetadata().client_id;
-  // std::cout << "[FAIRDB_LOG] WBM ScheduleFreeMem for client: " << client_id << " of size " << mem << std::endl;
   if (enabled()) {
     memory_active_.fetch_sub(mem, std::memory_order_relaxed);
   }
@@ -173,7 +175,6 @@ void WriteBufferManager::FreeMem(size_t mem) {
     std::cout << "[FAIRDB_LOG] Unaccounted FreeMem " << client_id << std::endl;
     return;
   }
-  // std::cout << "[FAIRDB_LOG] WBM FreeMem for client: " << client_id << " of size " << mem << std::endl;
   if (cache_res_mgr_ != nullptr) {
     FreeMemWithCache(mem);
   } else if (enabled()) {
@@ -187,8 +188,6 @@ void WriteBufferManager::FreeMem(size_t mem) {
 }
 
 void WriteBufferManager::FreeMemWithCache(size_t mem) {
-  // int client_id = TG_GetThreadMetadata().client_id;
-  // std::cout << "[FAIRDB_LOG] WBM FreeMemWithCache for client: " << client_id << " of size " << mem << std::endl;
   assert(cache_res_mgr_ != nullptr);
   // Use a mutex to protect various data structures. Can be optimized to a
   // lock-free solution if it ends up with a performance bottleneck.
@@ -211,8 +210,20 @@ void WriteBufferManager::BeginWriteStall(StallInterface* wbm_stall, int client_i
     return;
   }
   // Allocate outside of the lock.
-  std::list<StallInterface*> new_node = {wbm_stall};
 
+  // Increment the stall count for the client atomically
+  per_client_stall_count_[client_id].fetch_add(1, std::memory_order_relaxed);
+  size_t current_total_stalls = total_stall_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // Print stall counts every 100 total stalls
+  if (current_total_stalls % 100 == 0) {
+    std::cout << "Stall counts:" << std::endl;
+    for (size_t i = 0; i < per_client_stall_count_.size(); ++i) {
+      std::cout << "Client " << i << ": " << per_client_stall_count_[i].load(std::memory_order_relaxed) << " stalls" << std::endl;
+    }
+  }
+
+  std::list<StallInterface*> new_node = {wbm_stall};
   {
     std::unique_lock<std::mutex> lock(mu_);
     // Verify if the stall conditions are still active.

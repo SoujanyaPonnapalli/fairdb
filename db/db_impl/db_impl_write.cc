@@ -2356,10 +2356,8 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
 // Begins a stall on the current thread. Does not block other writer threads.
 void DBImpl::MultiTenantStallWrites() {
   int client_id = TG_GetThreadMetadata().client_id;
-  std::cout << "[FAIRDB_LOG] About to stall ID #" << client_id << " , num wbm_stall objects " << per_client_wbm_stall_.size() << std::endl;
   std::unique_ptr<StallInterface>& wbm_stall = per_client_wbm_stall_[client_id];
 
-  std::cout << "[FAIRDB_LOG] About to set state to BLOCKED for ID #" << client_id << "\n";
   // Change the state to State::Blocked.
   static_cast<WBMStallInterface*>(wbm_stall.get())
       ->SetState(WBMStallInterface::State::BLOCKED);
@@ -2367,9 +2365,7 @@ void DBImpl::MultiTenantStallWrites() {
   // Then WriteBufferManager will add this client's stall to its queue
   // and wake it up once sufficient memory is available.
   write_buffer_manager_->BeginWriteStall(wbm_stall.get(), client_id);
-  std::cout << "[FAIRDB_LOG] About to block ID #" << client_id << " due to memtable capacity reached\n";
   wbm_stall->Block();
-  std::cout << "[FAIRDB_LOG] Block complete\n";
 }
 
 // REQUIRES: mutex_ is held

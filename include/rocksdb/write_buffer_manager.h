@@ -197,6 +197,9 @@ bool ShouldFlush() const {
 
   std::ofstream mt_log_file_;
 
+  std::vector<std::atomic<size_t>> per_client_stall_count_;
+  std::atomic<int> total_stall_count_;
+
 
   void ReserveMemWithCache(size_t mem);
   void FreeMemWithCache(size_t mem);
