@@ -261,6 +261,17 @@ class LRUHandleTable {
   MemoryAllocator* const allocator_;
 };
 
+class LRUCache;
+
+struct FairDBCacheMetadata {
+  LRUCache* cache;
+  size_t capacity;
+  size_t reserved_capacity;
+  struct FairDBCacheMetadata* next;
+};
+
+typedef struct FairDBCacheMetadata FairDBCacheMetadata;
+
 // A single shard of sharded cache.
 class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
  public:
@@ -271,7 +282,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
                 bool use_adaptive_mutex,
                 CacheMetadataChargePolicy metadata_charge_policy,
                 int max_upper_hash_bits, MemoryAllocator* allocator,
-                const Cache::EvictionCallback* eviction_callback);
+                const Cache::EvictionCallback* eviction_callback,
+                FairDBCacheMetadata* cache_metadata);
 
  public:  // Type definitions expected as parameter to ShardedCache
   using HandleImpl = LRUHandle;
@@ -438,6 +450,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
 
   // A reference to Cache::eviction_callback_
   const Cache::EvictionCallback& eviction_callback_;
+
+  // A reference to the metadata in the fairdb cache manager
+  FairDBCacheMetadata* cache_metadata_;
 };
 
 class LRUCache
@@ -462,6 +477,19 @@ class LRUCache
   size_t TEST_GetLRUSize();
   // Retrieves high pri pool ratio.
   double GetHighPriPoolRatio();
+};
+
+class LRUCacheManager {
+  public:
+    LRUCacheManager ();
+    ~LRUCacheManager ();
+    size_t MakeSpace (FairDBCacheMetadata* requester, size_t space);
+    FairDBCacheMetadata* AddCache (LRUCache* cache, size_t capacity, size_t reserved_capacity);
+
+  private:
+    size_t caches_size;
+    mutable DMutex manager_mutex_;
+    FairDBCacheMetadata* caches;
 };
 
 }  // namespace lru_cache

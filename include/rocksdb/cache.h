@@ -243,6 +243,9 @@ struct LRUCacheOptions : public ShardedCacheOptions {
   // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
   bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
 
+  bool fairdb_use_pooled = false;
+  size_t fairdb_reserved_space;
+
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
                   bool _strict_capacity_limit, double _high_pri_pool_ratio,
@@ -250,13 +253,15 @@ struct LRUCacheOptions : public ShardedCacheOptions {
                   bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                   CacheMetadataChargePolicy _metadata_charge_policy =
                       kDefaultCacheMetadataChargePolicy,
-                  double _low_pri_pool_ratio = 0.0)
+                  double _low_pri_pool_ratio = 0.0,
+                  bool _fairdb_use_pooled=false)
       : ShardedCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
                             std::move(_memory_allocator),
                             _metadata_charge_policy),
         high_pri_pool_ratio(_high_pri_pool_ratio),
         low_pri_pool_ratio(_low_pri_pool_ratio),
-        use_adaptive_mutex(_use_adaptive_mutex) {}
+        use_adaptive_mutex(_use_adaptive_mutex),
+        fairdb_use_pooled(_fairdb_use_pooled) {}
 
   // Construct an instance of LRUCache using these options
   std::shared_ptr<Cache> MakeSharedCache() const;
