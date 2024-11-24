@@ -150,12 +150,7 @@ bool ShouldFlush() const {
   }
 
   // Returns true if stalling condition is met for the given client.
-  bool IsStallThresholdExceeded(int client_id) const {
-    // std::cout << "IsStallThresholdExceeded for " << client_id << ": " << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << " vs " << per_client_buffer_size_[client_id] << std::endl;
-
-    return per_client_memory_used_[client_id].load(std::memory_order_relaxed) >=
-           per_client_buffer_size_[client_id];
-  }
+  bool IsStallThresholdExceeded(int client_id) const;
 
   void ReserveMem(size_t mem);
 

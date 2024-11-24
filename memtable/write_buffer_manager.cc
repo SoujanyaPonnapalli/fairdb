@@ -32,7 +32,7 @@ WriteBufferManager::WriteBufferManager(size_t buffer_size,
                                        bool allow_stall,
                                        size_t num_clients)
     : buffer_size_(buffer_size),
-      mutable_limit_(buffer_size * 7 / 8),
+      mutable_limit_(buffer_size),
       memory_used_(0),
       per_client_memory_used_(num_clients),
       per_client_buffer_size_(num_clients, buffer_size),
@@ -42,8 +42,9 @@ WriteBufferManager::WriteBufferManager(size_t buffer_size,
       allow_stall_(allow_stall),
       per_client_stall_active_(num_clients),
       per_client_stall_count_(num_clients),  // Initialize stall count for clients
-      total_stall_count_(0) {  // Initialize total stalls
-  // Initialize per-client memory usage, stall flags, and stall counts
+      total_stall_count_(0) {
+        
+  std::cout << "[FAIRDB_LOG] WBM Size: " << buffer_size << std::endl;
   for (size_t i = 0; i < num_clients; ++i) {
     per_client_memory_used_[i] = 0;
     per_client_stall_active_[i] = false;
@@ -122,6 +123,12 @@ bool WriteBufferManager::ShouldStall(int client_id) const {
   return IsStallActive(client_id) || IsStallThresholdExceeded(client_id);
 }
 
+bool WriteBufferManager::IsStallThresholdExceeded(int client_id) const {
+    return per_client_memory_used_[client_id].load(std::memory_order_relaxed) >= per_client_buffer_size_[client_id];
+
+  // return (per_client_memory_usage(client_id) >= per_client_buffer_size_[client_id]) || (memory_usage() >= buffer_size_);
+}
+
 void WriteBufferManager::SetPerClientBufferSize(int client_id, size_t buffer_size) {
   per_client_buffer_size_[client_id] = buffer_size;
 }
@@ -151,7 +158,7 @@ void WriteBufferManager::ReserveMemWithCache(size_t mem) {
   // lock-free solution if it ends up with a performance bottleneck.
   std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
 
-  size_t new_mem_used = memory_used_.load(std::memory_order_relaxed) + mem;
+  size_t new_mem_used = memory_usage() + mem;
   memory_used_.store(new_mem_used, std::memory_order_relaxed);
   Status s = cache_res_mgr_->UpdateCacheReservation(new_mem_used);
 
@@ -178,8 +185,11 @@ void WriteBufferManager::FreeMem(size_t mem) {
   if (cache_res_mgr_ != nullptr) {
     FreeMemWithCache(mem);
   } else if (enabled()) {
-    memory_used_.fetch_sub(mem, std::memory_order_relaxed);
-    per_client_memory_used_[client_id].fetch_sub(mem, std::memory_order_relaxed);
+    size_t current_memory = memory_used_.load(std::memory_order_relaxed);
+    memory_used_.store(current_memory >= mem ? current_memory - mem : 0, std::memory_order_relaxed);
+
+    size_t client_memory = per_client_memory_used_[client_id].load(std::memory_order_relaxed);
+    per_client_memory_used_[client_id].store(client_memory >= mem ? client_memory - mem : 0, std::memory_order_relaxed);
   }
   mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",free," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
 
@@ -189,17 +199,16 @@ void WriteBufferManager::FreeMem(size_t mem) {
 
 void WriteBufferManager::FreeMemWithCache(size_t mem) {
   assert(cache_res_mgr_ != nullptr);
-  // Use a mutex to protect various data structures. Can be optimized to a
-  // lock-free solution if it ends up with a performance bottleneck.
   std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
-  size_t new_mem_used = memory_used_.load(std::memory_order_relaxed) - mem;
+
+  size_t current_memory = memory_usage();
+  size_t new_mem_used = current_memory >= mem ? current_memory - mem : 0;
   memory_used_.store(new_mem_used, std::memory_order_relaxed);
+
   Status s = cache_res_mgr_->UpdateCacheReservation(new_mem_used);
 
   // We absorb the error since WriteBufferManager is not able to handle
   // this failure properly.
-  // [TODO] We'll need to improve it in the future and figure out what to do on
-  // error
   s.PermitUncheckedError();
 }
 
