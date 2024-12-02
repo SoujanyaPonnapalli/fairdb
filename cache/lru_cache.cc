@@ -20,152 +20,115 @@
 #include "port/lang.h"
 #include "util/distributed_mutex.h"
 
+#include <chrono>
+#include <ctime>
+
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
 
-static LRUCacheManager lru_cache_manager = LRUCacheManager();
-
-LRUCacheManager::LRUCacheManager () : manager_mutex_(true), caches(nullptr), caches_size(0) {}
-
-// Earlier implementation: evict records from client who has the largest capacity
-
-// void LRUCacheManager::MakeSpace (FairDBCacheMetadata* requester, size_t space) {
-//   if (!caches) {
-//     return;
-//   }
-
-//   size_t highest_allocation = 0;
-//   FairDBCacheMetadata* highest_alloc_metaptr;
-
-//   FairDBCacheMetadata* metadata_ptr = caches;
-//   while (metadata_ptr) {
-//     if (metadata_ptr->capacity > highest_allocation && metadata_ptr != requester) {
-//       highest_allocation = metadata_ptr->capacity;
-//       highest_alloc_metaptr = metadata_ptr;
-//     }
-//     metadata_ptr = metadata_ptr->next;
-//   }
-
-//   if (highest_allocation == 0) {
-//     return;
-//   }
-
-//   size_t new_capacity = highest_allocation - space;
-//   size_t actual_space_added = space;
-//   if (new_capacity < highest_alloc_metaptr->reserved_capacity) {
-//     size_t still_left = highest_alloc_metaptr->reserved_capacity - new_capacity;
-//     actual_space_added -= still_left;
-//     MakeSpace(requester, still_left);
-//     new_capacity = highest_alloc_metaptr->reserved_capacity;
-//   }
-
-//   printf("New capacity for another cache is %d, actual space added to this cache is %d\n", new_capacity, actual_space_added);
-
-//   {
-//     DMutexLock l(manager_mutex_);
-//     printf("Calling set capacity\n");
-//     highest_alloc_metaptr->cache->SetCapacity(new_capacity);
-//     requester->cache->SetCapacity(requester->capacity + actual_space_added);
-//     highest_alloc_metaptr->capacity = new_capacity;
-//     requester->capacity += actual_space_added;
-//   }
-//   printf("Made space! new capacity %d\n", requester->capacity);
-// }
-
-size_t LRUCacheManager::MakeSpace (FairDBCacheMetadata* requester, size_t space) {
-  if (!caches) {
-    return 0;
-  }
-  if (caches_size <= 1) {
-    return 0;
-  }
-
-  size_t caches_remaining = caches_size - 1;
-  ssize_t space_remaining = space;
-  size_t per_cache_space;
-  {
-    DMutexLock l(manager_mutex_);
-
-    bool need_more_round = true;
-    bool first_time = true;
-    while (need_more_round && caches_remaining && space_remaining > 0) {
-      per_cache_space = space_remaining / caches_remaining + caches_remaining; // more can be removed
-      need_more_round = false;
-      FairDBCacheMetadata* metadata_ptr = caches;
-      while (metadata_ptr) {
-        if (metadata_ptr == requester) {}
-        else if (! first_time && metadata_ptr->capacity == metadata_ptr->reserved_capacity) {}
-        else if (metadata_ptr->capacity < metadata_ptr->reserved_capacity + per_cache_space) {
-          caches_remaining -= 1;
-          need_more_round = true;
-          if (metadata_ptr->capacity != metadata_ptr->reserved_capacity) {
-            space_remaining -= (metadata_ptr->capacity - metadata_ptr->reserved_capacity);
-            metadata_ptr->capacity = metadata_ptr->reserved_capacity;
-            metadata_ptr->cache->SetCapacity(metadata_ptr->capacity);
-          }
-        }
-        metadata_ptr = metadata_ptr->next;
-      }
-      first_time = false;
-    }
-
-    if (caches_remaining == 0 || space_remaining <= 0) {
-      // No caches left to remove things from
-      if (space != space_remaining) {
-        // some space was still removed from other caches
-        size_t space_removed = space - space_remaining;
-        requester->capacity += space_removed;
-        requester->cache->SetCapacity(requester->capacity);
-      }
-      return space - space_remaining;
-    }
-
-    // Now simply go through once and subtract by per cache space
-    FairDBCacheMetadata* metadata_ptr = caches;
-    while (metadata_ptr) {
-      if (metadata_ptr == requester) {}
-      else if (metadata_ptr->capacity == metadata_ptr->reserved_capacity) {}
-      else {
-        metadata_ptr->capacity -= per_cache_space;
-        metadata_ptr->cache->SetCapacity(metadata_ptr->capacity);
-        space_remaining -= per_cache_space;
-      }
-      metadata_ptr = metadata_ptr->next;
-    }
-
-    if (space != space_remaining) {
-      // some space was still removed from other caches
-      size_t space_removed = space - space_remaining;
-      requester->capacity += space_removed;
-      requester->cache->SetCapacity(requester->capacity);
-    }
-    return space - space_remaining;
-  }
+long get_current_time () {
+  // Get the current time as a time_point
+  auto now = std::chrono::system_clock::now();
+  
+  // Convert to a time_point representing the duration since epoch
+  auto duration = now.time_since_epoch();
+  
+  // Convert to milliseconds
+  auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
+  return milliseconds.count();
 }
 
-FairDBCacheMetadata* LRUCacheManager::AddCache (LRUCache* cache, size_t capacity, size_t reserved_capacity) {
+static LRUCacheManager* lru_cache_manager = nullptr;
+
+LRUCacheManager::LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts) :
+    manager_mutex_(true),
+    request_additional_delay_microseconds(request_additional_delay_microseconds_),
+    read_io_mbps(read_io_mbps_),
+    additional_bursting_supported(K) {
+  caches = new std::map<int, FairDBCacheMetadata*> ();
+  opts.manager_ptr = this;
+  main_cache = std::make_shared<LRUCache>(opts);
+}
+
+FairDBCacheMetadata* LRUCacheManager::AddCache (int client_id, size_t capacity, size_t reserved_capacity) {
   FairDBCacheMetadata* metadata = new FairDBCacheMetadata;
-  metadata->cache = cache;
   metadata->capacity = capacity;
   metadata->reserved_capacity = reserved_capacity;
-  metadata->next = caches;
-  caches = metadata;
-  caches_size ++;
+  caches->emplace(client_id, metadata);
   return metadata;
 }
 
-void delete_linked_list (FairDBCacheMetadata* lst) {
-  if (!lst) {
-    return;
+FairDBCacheMetadata* LRUCacheManager::GetElement (int client_id) {
+  auto element_it = caches->find(client_id);
+  assert (element_it != caches->end());
+  FairDBCacheMetadata* element = element_it->second;
+  return element;
+}
+
+void LRUCacheManager::IncrementAllocation (int client_id, size_t capacity) {
+  if (client_id == -1) return;
+  FairDBCacheMetadata* element = GetElement(client_id);
+  element->capacity += capacity;
+}
+
+size_t LRUCacheManager::DecrementAllocation (int client_id, size_t capacity) {
+  if (client_id == -1) return 0;
+  FairDBCacheMetadata* element = GetElement(client_id);
+  
+  if (element->capacity > capacity) {
+    element->capacity -= capacity;
+    return capacity;
+  } else {
+    size_t change = element->capacity;
+    element->capacity = 0;
+    return change;
   }
-  if (lst->next) {
-    delete_linked_list(lst->next);
+}
+
+void LRUCacheManager::MarkActiveUser (int client_id) {
+  // TODO (devbali): Implement a way to have user be deactivated too
+  if (client_id == -1) return;
+
+  if (active_users.find(client_id) == active_users.end()) {
+    // client id not in active users
+    DMutexLock l(manager_mutex_);
+    active_users.emplace(client_id);
+
+    size_t N = caches->size();
+    size_t TOTAL = main_cache->GetCapacity();
+    size_t K = additional_bursting_supported;
+    size_t M = active_users.size();
+    // RAD = (40-R) * 1/(1600 / (M + 2))
+    // TOTAL/N - R = RAD * (rio / M + 2)
+    // TOTAL/N - RAD * (rio / M + 2) = R
+
+    if (M + K == 0 || N == 0) {
+      return;
+    }
+
+    ssize_t reserved_needed = TOTAL / N 
+      - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / (M + K);
+    
+    if (reserved_needed < 0) {
+      current_reservation_standard_ = 0;
+    } else {
+      current_reservation_standard_ = reserved_needed;
+    }
+    
+    for (auto caches_iterator = caches->begin(); caches_iterator != caches->end(); ++caches_iterator) {
+      FairDBCacheMetadata* meta = caches_iterator->second;
+      meta->reserved_capacity = current_reservation_standard_;
+    }
+    printf("Added an active user. Number of active users now is %d. The reserved capacity standard now is %d\n", M, current_reservation_standard_);
   }
-  delete lst;
 }
 
 LRUCacheManager::~LRUCacheManager () {
-  delete_linked_list(caches);
+  for (std::map<int, FairDBCacheMetadata*>::iterator it = caches->begin(); it != caches->end(); ++it) {
+    delete it->second;
+  }
+
+  delete caches;
 }
 
 LRUHandleTable::LRUHandleTable(int max_upper_hash_bits,
@@ -265,7 +228,8 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                              int max_upper_hash_bits,
                              MemoryAllocator* allocator,
                              const Cache::EvictionCallback* eviction_callback,
-                             FairDBCacheMetadata* cache_metadata)
+                             void* cache_metadata,
+                             std::atomic<uint64_t>* hit_ctr, std::atomic<uint64_t>* miss_ctr)
     : CacheShardBase(metadata_charge_policy),
       capacity_(0),
       high_pri_pool_usage_(0),
@@ -280,7 +244,9 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       lru_usage_(0),
       mutex_(use_adaptive_mutex),
       eviction_callback_(*eviction_callback),
-      cache_metadata_ (cache_metadata) {
+      cache_metadata_ (cache_metadata),
+      hit_ctr_ (hit_ctr),
+      miss_ctr_ (miss_ctr) {
   // Make empty circular linked list.
   lru_.next = &lru_;
   lru_.prev = &lru_;
@@ -398,6 +364,8 @@ void LRUCacheShard::LRU_Remove(LRUHandle* e) {
     assert(low_pri_pool_usage_ >= e->total_charge);
     low_pri_pool_usage_ -= e->total_charge;
   }
+  if (cache_metadata_)
+    ((LRUCacheManager*) cache_metadata_)->DecrementAllocation(e->client_id, e->total_charge);
 }
 
 void LRUCacheShard::LRU_Insert(LRUHandle* e) {
@@ -439,6 +407,9 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     }
     lru_bottom_pri_ = e;
   }
+  // Add this amount to the manager counts
+  if (cache_metadata_)
+    ((LRUCacheManager*) cache_metadata_)->IncrementAllocation(e->client_id, e->total_charge);
   lru_usage_ += e->total_charge;
 }
 
@@ -469,16 +440,37 @@ void LRUCacheShard::MaintainPoolSize() {
 
 void LRUCacheShard::EvictFromLRU(size_t charge,
                                  autovector<LRUHandle*>* deleted) {
+  std::vector<LRUHandle*> readd;
+
   while ((usage_ + charge) > capacity_ && lru_.next != &lru_) {
     LRUHandle* old = lru_.next;
     // LRU list contains only elements which can be evicted.
     assert(old->InCache() && !old->HasRefs());
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
-    old->SetInCache(false);
-    assert(usage_ >= old->total_charge);
-    usage_ -= old->total_charge;
-    deleted->push_back(old);
+
+    bool dont_really_remove = false;
+    if (cache_metadata_) {
+      FairDBCacheMetadata* old_meta = (((LRUCacheManager*) cache_metadata_)->GetAllocations())->at(old->client_id);
+      if (old_meta->capacity < old_meta->reserved_capacity) {
+        dont_really_remove = true;
+      }
+    }
+
+    if (dont_really_remove) {
+      readd.push_back(old);
+    } else {
+      old->SetInCache(false);
+      assert(usage_ >= old->total_charge);
+      usage_ -= old->total_charge;
+      deleted->push_back(old);
+      
+    }
+  }
+
+  while (readd.size() > 0) {
+    LRU_Insert(readd.back());
+    readd.pop_back();
   }
 }
 
@@ -519,25 +511,13 @@ void LRUCacheShard::SetStrictCapacityLimit(bool strict_capacity_limit) {
 Status LRUCacheShard::InsertItem(LRUHandle* e, LRUHandle** handle) {
   Status s = Status::OK();
   autovector<LRUHandle*> last_reference_list;
-  bool skip_evictions = false;
-  if (cache_metadata_) {
-    if ((usage_ + e->total_charge) > capacity_) {
-        size_t space_needed = (usage_ + e->total_charge) - capacity_;
-        size_t space_made = lru_cache_manager.MakeSpace(cache_metadata_, space_needed);
-        if (space_needed <= space_made) {
-          skip_evictions = true;
-        }
-      }
-  }
 
   {
     DMutexLock l(mutex_);
 
     // Free the space following strict LRU policy until enough space
     // is freed or the lru list is empty.
-    if (!skip_evictions) {
-      EvictFromLRU(e->total_charge, &last_reference_list);
-    }
+    EvictFromLRU(e->total_charge, &last_reference_list);
 
     if ((usage_ + e->total_charge) > capacity_ &&
         (strict_capacity_limit_ || handle == nullptr)) {
@@ -602,6 +582,9 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
     }
     e->Ref();
     e->SetHit();
+    (*hit_ctr_)++;
+  } else {
+    (*miss_ctr_)++;
   }
   return e;
 }
@@ -684,7 +667,7 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
 LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
                                        Cache::ObjectPtr value,
                                        const Cache::CacheItemHelper* helper,
-                                       size_t charge) {
+                                       size_t charge, int client_id) {
   assert(helper);
   // value == nullptr is reserved for indicating failure in SecondaryCache
   assert(!(helper->IsSecondaryCacheCompatible() && value == nullptr));
@@ -695,6 +678,7 @@ LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
   LRUHandle* e =
       static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
 
+  e->client_id = client_id;
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
@@ -714,7 +698,13 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash,
                              const Cache::CacheItemHelper* helper,
                              size_t charge, LRUHandle** handle,
                              Cache::Priority priority) {
-  LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  TGThreadMetadata& thread_metadata = TG_GetThreadMetadata();
+  int client_id = thread_metadata.client_id;
+  if (cache_metadata_) {
+    LRUCacheManager* manager = (LRUCacheManager*) cache_metadata_;
+    manager->MarkActiveUser(client_id);
+  }
+  LRUHandle* e = CreateHandle(key, hash, value, helper, charge, client_id);
   e->SetPriority(priority);
   e->SetInCache(true);
   return InsertItem(e, handle);
@@ -725,7 +715,7 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
                                            const Cache::CacheItemHelper* helper,
                                            size_t charge,
                                            bool allow_uncharged) {
-  LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  LRUHandle* e = CreateHandle(key, hash, value, helper, charge, -1);
   e->SetIsStandalone(true);
   e->Ref();
 
@@ -812,13 +802,8 @@ void LRUCacheShard::AppendPrintableOptions(std::string& str) const {
   str.append(buffer);
 }
 
-LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts) {
-  FairDBCacheMetadata* ref = nullptr;
-  if (opts.fairdb_use_pooled) {
-    printf("Adding LRU Cache to manager of capacity %d\n", capacity_);
-    ref = lru_cache_manager.AddCache(this, capacity_, opts.fairdb_reserved_space);
-  }
-
+LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts), 
+manager_ptr_(opts.manager_ptr), client_id_ (opts.client_id), hit_ctr_(0), miss_ctr_(0) {
   size_t per_shard = GetPerShardCapacity();
   MemoryAllocator* alloc = memory_allocator();
   InitShards([&](LRUCacheShard* cs) {
@@ -826,9 +811,18 @@ LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts) {
                            opts.high_pri_pool_ratio, opts.low_pri_pool_ratio,
                            opts.use_adaptive_mutex, opts.metadata_charge_policy,
                            /* max_upper_hash_bits */ 32 - opts.num_shard_bits,
-                           alloc, &eviction_callback_, ref);
+                           alloc, &eviction_callback_, opts.manager_ptr, &hit_ctr_, &miss_ctr_);
   });
   
+}
+
+size_t LRUCache::GetUsage () {
+  LRUCacheManager* manager = (LRUCacheManager*) (manager_ptr_);
+  if (manager) {
+    return manager->GetElement(client_id_)->capacity;
+  } else {
+    return 0;
+  }
 }
 
 Cache::ObjectPtr LRUCache::Value(Handle* handle) {
@@ -888,6 +882,14 @@ std::shared_ptr<Cache> LRUCacheOptions::MakeSharedCache() const {
   LRUCacheOptions opts = *this;
   if (opts.num_shard_bits < 0) {
     opts.num_shard_bits = GetDefaultCacheShardBits(capacity);
+  }
+
+  if (opts.fairdb_use_pooled) {
+    if (rocksdb::lru_cache::lru_cache_manager == nullptr) {
+      rocksdb::lru_cache::lru_cache_manager = new rocksdb::lru_cache::LRUCacheManager(opts.request_additional_delay_microseconds, opts.read_io_mbps, opts.additional_rampups_supported, opts);
+    }
+    rocksdb::lru_cache::lru_cache_manager->AddCache(opts.client_id, opts.pooled_capacity, opts.fairdb_reserved_space);
+    return rocksdb::lru_cache::lru_cache_manager->GetMainCache();
   }
   std::shared_ptr<Cache> cache = std::make_shared<LRUCache>(opts);
   if (secondary_cache) {

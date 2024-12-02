@@ -355,6 +355,9 @@ class Cache : public Customizable {
   // Returns the memory size for the entries residing in the cache.
   virtual size_t GetUsage() const = 0;
 
+  virtual size_t GetAndResetHits() = 0;
+  virtual size_t GetAndResetMisses() = 0;
+
   // Returns the number of entries currently tracked in the table. SIZE_MAX
   // means "not supported." This is used for inspecting the load factor, along
   // with GetTableAddressCount().
@@ -620,6 +623,9 @@ class CacheWrapper : public Cache {
   size_t GetTableAddressCount() const override {
     return target_->GetTableAddressCount();
   }
+
+  uint64_t GetAndResetHits () const { return 0; }
+  uint64_t GetAndResetMisses () const { return 0; }
 
   size_t GetCapacity() const override { return target_->GetCapacity(); }
 

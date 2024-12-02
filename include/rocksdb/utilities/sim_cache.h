@@ -84,6 +84,14 @@ class SimCache : public CacheWrapper {
   // Status of cache logging happening in background
   virtual Status GetActivityLoggingStatus() = 0;
 
+  inline uint64_t GetAndResetHits() override {
+    return 0;
+  }
+
+  inline uint64_t GetAndResetMisses() override {
+    return 0;
+  }
+
  private:
   SimCache(const SimCache&);
   SimCache& operator=(const SimCache&);

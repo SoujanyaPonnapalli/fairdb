@@ -1148,6 +1148,14 @@ class FixedHyperClockCache
 
   const char* Name() const override { return "FixedHyperClockCache"; }
 
+  inline uint64_t GetAndResetHits() override {
+    return 0;
+  }
+
+  inline uint64_t GetAndResetMisses() override {
+    return 0;
+  }
+
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;
 };  // class FixedHyperClockCache
@@ -1161,6 +1169,14 @@ class AutoHyperClockCache
   using BaseHyperClockCache::BaseHyperClockCache;
 
   const char* Name() const override { return "AutoHyperClockCache"; }
+
+  inline uint64_t GetAndResetHits() override {
+    return 0;
+  }
+
+  inline uint64_t GetAndResetMisses() override {
+    return 0;
+  }
 
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;

@@ -47,6 +47,14 @@ class ChargedCache : public CacheWrapper {
 
   void SetCapacity(size_t capacity) override;
 
+  inline uint64_t GetAndResetHits() override {
+    return 0;
+  }
+
+  inline uint64_t GetAndResetMisses() override {
+    return 0;
+  }
+
   inline Cache* GetCache() const { return target_.get(); }
 
   inline ConcurrentCacheReservationManager* TEST_GetCacheReservationManager()

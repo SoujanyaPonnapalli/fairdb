@@ -18,6 +18,7 @@
 #include "port/port.h"
 #include "util/autovector.h"
 #include "util/distributed_mutex.h"
+#include <set>
 
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
@@ -49,6 +50,7 @@ namespace lru_cache {
 
 struct LRUHandle : public Cache::Handle {
   Cache::ObjectPtr value;
+  int client_id;
   const Cache::CacheItemHelper* helper;
   LRUHandle* next_hash;
   LRUHandle* next;
@@ -264,10 +266,9 @@ class LRUHandleTable {
 class LRUCache;
 
 struct FairDBCacheMetadata {
-  LRUCache* cache;
-  size_t capacity;
-  size_t reserved_capacity;
-  struct FairDBCacheMetadata* next;
+  int client_id;
+  std::atomic<size_t> capacity;
+  std::atomic<size_t> reserved_capacity;
 };
 
 typedef struct FairDBCacheMetadata FairDBCacheMetadata;
@@ -283,7 +284,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
                 CacheMetadataChargePolicy metadata_charge_policy,
                 int max_upper_hash_bits, MemoryAllocator* allocator,
                 const Cache::EvictionCallback* eviction_callback,
-                FairDBCacheMetadata* cache_metadata);
+                void* cache_metadata, std::atomic<uint64_t>* hit_ctr,
+                std::atomic<uint64_t>* miss_ctr);
 
  public:  // Type definitions expected as parameter to ShardedCache
   using HandleImpl = LRUHandle;
@@ -385,7 +387,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
 
   LRUHandle* CreateHandle(const Slice& key, uint32_t hash,
                           Cache::ObjectPtr value,
-                          const Cache::CacheItemHelper* helper, size_t charge);
+                          const Cache::CacheItemHelper* helper, size_t charge,
+                          int client_id);
 
   // Initialized before use.
   size_t capacity_;
@@ -451,8 +454,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // A reference to Cache::eviction_callback_
   const Cache::EvictionCallback& eviction_callback_;
 
-  // A reference to the metadata in the fairdb cache manager
-  FairDBCacheMetadata* cache_metadata_;
+  // A reference to the cache manager
+  void* cache_metadata_;
+
+  std::atomic<uint64_t>* hit_ctr_;
+  std::atomic<uint64_t>* miss_ctr_;
 };
 
 class LRUCache
@@ -465,7 +471,15 @@ class LRUCache
   const char* Name() const override { return "LRUCache"; }
   ObjectPtr Value(Handle* handle) override;
   size_t GetCharge(Handle* handle) const override;
+  size_t GetUsage ();
   const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
+  inline uint64_t GetAndResetHits () override {
+    return hit_ctr_.exchange(0);
+  }
+
+  inline uint64_t GetAndResetMisses () override {
+    return miss_ctr_.exchange(0);
+  }
 
   void ApplyToHandle(
       Cache* cache, Handle* handle,
@@ -477,19 +491,40 @@ class LRUCache
   size_t TEST_GetLRUSize();
   // Retrieves high pri pool ratio.
   double GetHighPriPoolRatio();
+
+  std::atomic<uint64_t> hit_ctr_;
+  std::atomic<uint64_t> miss_ctr_;
+  
+
+ private:
+  void* manager_ptr_;
+  int client_id_;
 };
 
 class LRUCacheManager {
   public:
-    LRUCacheManager ();
+    LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts);
     ~LRUCacheManager ();
-    size_t MakeSpace (FairDBCacheMetadata* requester, size_t space);
-    FairDBCacheMetadata* AddCache (LRUCache* cache, size_t capacity, size_t reserved_capacity);
+    FairDBCacheMetadata* AddCache (int client_id, size_t capacity, size_t reserved_capacity);
+    FairDBCacheMetadata* GetElement (int client_id);
+    void IncrementAllocation (int client_id, size_t capacity);
+    size_t DecrementAllocation (int client_id, size_t capacity);
+    void MarkActiveUser (int client_id);
+
+    inline std::map<int, FairDBCacheMetadata*>* GetAllocations () { return caches; }
+    inline std::shared_ptr<LRUCache> GetMainCache () { return main_cache; }
 
   private:
     size_t caches_size;
     mutable DMutex manager_mutex_;
-    FairDBCacheMetadata* caches;
+    std::map<int, FairDBCacheMetadata*>* caches;
+    std::set<int> active_users;
+    std::shared_ptr<LRUCache> main_cache;
+    size_t current_reservation_standard_;
+    size_t num_active_users;
+    size_t request_additional_delay_microseconds;
+    size_t read_io_mbps;
+    size_t additional_bursting_supported;
 };
 
 }  // namespace lru_cache
@@ -497,5 +532,6 @@ class LRUCacheManager {
 using LRUCache = lru_cache::LRUCache;
 using LRUHandle = lru_cache::LRUHandle;
 using LRUCacheShard = lru_cache::LRUCacheShard;
+using LRUCacheManager = lru_cache::LRUCacheManager;
 
 }  // namespace ROCKSDB_NAMESPACE

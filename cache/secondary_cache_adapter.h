@@ -59,6 +59,14 @@ class CacheWithSecondaryAdapter : public CacheWrapper {
 
   SecondaryCache* TEST_GetSecondaryCache() { return secondary_cache_.get(); }
 
+  inline uint64_t GetAndResetHits() override {
+    return 0;
+  }
+
+  inline uint64_t GetAndResetMisses() override {
+    return 0;
+  }
+
  private:
   static constexpr size_t kReservationChunkSize = 1 << 20;
 

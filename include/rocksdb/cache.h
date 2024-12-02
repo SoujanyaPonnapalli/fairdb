@@ -245,6 +245,13 @@ struct LRUCacheOptions : public ShardedCacheOptions {
 
   bool fairdb_use_pooled = false;
   size_t fairdb_reserved_space;
+  int client_id;
+
+  size_t pooled_capacity;
+  size_t request_additional_delay_microseconds;
+  size_t read_io_mbps;
+  size_t additional_rampups_supported;
+  void* manager_ptr = nullptr;
 
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
