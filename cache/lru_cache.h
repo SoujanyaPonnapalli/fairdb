@@ -265,12 +265,6 @@ class LRUHandleTable {
 
 class LRUCache;
 
-struct FairDBCacheMetadata {
-  int client_id;
-  std::atomic<size_t> capacity;
-  std::atomic<size_t> reserved_capacity;
-};
-
 typedef struct FairDBCacheMetadata FairDBCacheMetadata;
 
 // A single shard of sharded cache.
@@ -284,7 +278,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
                 CacheMetadataChargePolicy metadata_charge_policy,
                 int max_upper_hash_bits, MemoryAllocator* allocator,
                 const Cache::EvictionCallback* eviction_callback,
-                void* cache_metadata, std::atomic<uint64_t>* hit_ctr,
+                LRUCacheManager* lru_manager, std::atomic<uint64_t>* hit_ctr,
                 std::atomic<uint64_t>* miss_ctr);
 
  public:  // Type definitions expected as parameter to ShardedCache
@@ -455,7 +449,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   const Cache::EvictionCallback& eviction_callback_;
 
   // A reference to the cache manager
-  void* cache_metadata_;
+  LRUCacheManager* lru_manager_;
 
   std::atomic<uint64_t>* hit_ctr_;
   std::atomic<uint64_t>* miss_ctr_;
@@ -474,11 +468,11 @@ class LRUCache
   size_t GetUsage ();
   const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
   inline uint64_t GetAndResetHits () override {
-    return hit_ctr_.exchange(0);
+    return hit_ctr_;
   }
 
   inline uint64_t GetAndResetMisses () override {
-    return miss_ctr_.exchange(0);
+    return miss_ctr_;
   }
 
   void ApplyToHandle(
@@ -497,34 +491,8 @@ class LRUCache
   
 
  private:
-  void* manager_ptr_;
+  LRUCacheManager* manager_ptr_;
   int client_id_;
-};
-
-class LRUCacheManager {
-  public:
-    LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts);
-    ~LRUCacheManager ();
-    FairDBCacheMetadata* AddCache (int client_id, size_t capacity, size_t reserved_capacity);
-    FairDBCacheMetadata* GetElement (int client_id);
-    void IncrementAllocation (int client_id, size_t capacity);
-    size_t DecrementAllocation (int client_id, size_t capacity);
-    void MarkActiveUser (int client_id);
-
-    inline std::map<int, FairDBCacheMetadata*>* GetAllocations () { return caches; }
-    inline std::shared_ptr<LRUCache> GetMainCache () { return main_cache; }
-
-  private:
-    size_t caches_size;
-    mutable DMutex manager_mutex_;
-    std::map<int, FairDBCacheMetadata*>* caches;
-    std::set<int> active_users;
-    std::shared_ptr<LRUCache> main_cache;
-    size_t current_reservation_standard_;
-    size_t num_active_users;
-    size_t request_additional_delay_microseconds;
-    size_t read_io_mbps;
-    size_t additional_bursting_supported;
 };
 
 }  // namespace lru_cache
