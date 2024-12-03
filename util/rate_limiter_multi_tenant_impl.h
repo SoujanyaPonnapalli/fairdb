@@ -139,8 +139,8 @@ class MultiTenantRateLimiter : public RateLimiter {
   port::CondVar exit_cv_;
   int32_t requests_to_wait_;
 
-  int64_t total_requests_[Env::IO_TOTAL];
-  int64_t total_bytes_through_[Env::IO_TOTAL];
+  std::atomic<int64_t> total_requests_[Env::IO_TOTAL];
+  std::atomic<int64_t> total_bytes_through_[Env::IO_TOTAL];
   // int64_t available_bytes_;
   int64_t next_refill_us_;
 
@@ -156,7 +156,7 @@ class MultiTenantRateLimiter : public RateLimiter {
   int num_clients_;
   std::vector<std::atomic<int64_t>> rate_bytes_per_sec_;
   std::vector<std::atomic<int64_t>> refill_bytes_per_period_;
-  std::vector<int64_t> available_bytes_;
+  std::vector<std::atomic<int64_t>> available_bytes_;
   std::map<ReqKey, std::deque<Req*>> request_queue_map_;
   std::vector<int64_t> calls_per_client_;
   std::vector<int64_t> bytes_per_client_;

@@ -87,6 +87,7 @@ MultiTenantRateLimiter::MultiTenantRateLimiter(
       num_clients_(num_clients),
       rate_bytes_per_sec_(num_clients),
       refill_bytes_per_period_(num_clients),
+      available_bytes_(num_clients),
       mode_(mode) {
   // Initialize per-priority counters.
   for (int i = Env::IO_LOW; i < Env::IO_TOTAL; ++i) {
@@ -97,9 +98,9 @@ MultiTenantRateLimiter::MultiTenantRateLimiter(
   for (int i = 0; i < num_clients; ++i) {
     rate_bytes_per_sec_[i].store(bytes_per_sec[i]);
     refill_bytes_per_period_[i].store(CalculateRefillBytesPerPeriodLocked(bytes_per_sec[i]));
+    available_bytes_[i].store(refill_bytes_per_period_[i].load(std::memory_order_relaxed));
     calls_per_client_.emplace_back(0);
     bytes_per_client_.emplace_back(0);
-    available_bytes_.emplace_back(0);
   }
   // Create (empty) queue for each client-priority pair.
   for (int c_id = 0; c_id < num_clients; ++c_id) {
@@ -190,7 +191,8 @@ int64_t MultiTenantRateLimiter::GetSingleBurstBytes(OpType op_type) const {
 }
 
 int64_t MultiTenantRateLimiter::GetSingleBurstBytes(int client_id) const {
-  return 2 * 1024 * 1024;  // 2 MB
+  return refill_bytes_per_period_[client_id].load(std::memory_order_relaxed);
+  // return 2 * 1024 * 1024;  // 2 MB
 
   // int64_t raw_single_burst_bytes =
   //     raw_single_burst_bytes_.load(std::memory_order_relaxed);
@@ -278,58 +280,54 @@ void MultiTenantRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
   
   calls_per_client_[client_id]++;
   bytes_per_client_[client_id] += bytes;
-  if (total_calls_++ >= 10000) {
-    total_calls_ = 0;
-    std::cout << "[FAIRDB_LOG] RL calls and bytes per-client for ";
-    if (mode_ == rocksdb::RateLimiter::Mode::kReadsOnly) {
-      std::cout << "READ: ";
-    } else {
-      std::cout << "WRITE: ";
-    }
-    std::cout << std::endl;
-    for (size_t i = 0; i < calls_per_client_.size(); ++i) {
-      std::cout << "Client " << i << ": " << calls_per_client_[i] << " calls, " << (bytes_per_client_[i]/1024/1024) << " MB\n";
-    }
-    std::cout << "Unassigned: " << unassigned_calls_ << " calls, " << (unassigned_bytes_/1024/1024) << " MB.\n";
-    std::cout << "Compaction: " << compaction_calls_ << " calls, " << (compaction_bytes_/1024/1024) << " MB.\n";
-  }
+  // if (total_calls_++ >= 1'000'000) {
+  //   total_calls_ = 0;
+  //   std::cout << "[FAIRDB_LOG] RL calls and bytes per-client for ";
+  //   if (mode_ == rocksdb::RateLimiter::Mode::kReadsOnly) {
+  //     std::cout << "READ: ";
+  //   } else {
+  //     std::cout << "WRITE: ";
+  //   }
+  //   std::cout << std::endl;
+  //   for (size_t i = 0; i < calls_per_client_.size(); ++i) {
+  //     std::cout << "Client " << i << ": " << calls_per_client_[i] << " calls, " << (bytes_per_client_[i]/1024/1024) << " MB\n";
+  //   }
+  //   std::cout << "Unassigned: " << unassigned_calls_ << " calls, " << (unassigned_bytes_/1024/1024) << " MB.\n";
+  //   std::cout << "Compaction: " << compaction_calls_ << " calls, " << (compaction_bytes_/1024/1024) << " MB.\n";
+  // }
 
   assert(bytes <= GetSingleBurstBytes(client_id));
   bytes = std::max(static_cast<int64_t>(0), bytes);
   TEST_SYNC_POINT("MultiTenantRateLimiter::Request");
   TEST_SYNC_POINT_CALLBACK("MultiTenantRateLimiter::Request:1",
                            &rate_bytes_per_sec_);
-  MutexLock g_lock(&request_mutex_);
+  
+  total_requests_[pri].fetch_add(1, std::memory_order_relaxed);
 
-  // auto now_us = std::chrono::time_point_cast<std::chrono::microseconds>( std::chrono::high_resolution_clock::now());
-  // long now = now_us.time_since_epoch().count();
-  // std::cout << "compaction_test," << now << ",";
-  // if (read_rate_limiter_ == nullptr) {
-  //   std::cout << "read,";
-  // } else {
-  //   std::cout << "write,";
-  // }
-  // std::cout << bytes << "," << GetSingleBurstBytes(client_id) << std::endl;
+  // **Attempt to consume available bytes without holding the mutex**
+  int64_t available = available_bytes_[client_id].load(std::memory_order_relaxed);
+  if (available > 0) {
+    int64_t bytes_through = std::min(available, bytes);
+    // Atomically decrease available bytes, ensuring it doesn't go negative
+    int64_t expected = available;
+    while (!available_bytes_[client_id].compare_exchange_weak(
+        expected, expected - bytes_through, std::memory_order_relaxed)) {
+      // Retry if the value changed
+      bytes_through = std::min(expected, bytes);
+    }
+    total_bytes_through_[pri].fetch_add(bytes_through, std::memory_order_relaxed);
+    bytes -= bytes_through;
+  }
 
-  if (stop_) {
-    // It is now in the clean-up of ~MultiTenantRateLimiter().
-    // Therefore any new incoming request will exit from here
-    // and not get satisfied.
+  if (bytes == 0) {
+    // All bytes granted; no need to wait
     return;
   }
 
-  ++total_requests_[pri];
+  // Acquire the mutex after checking if bytes == 0
+  MutexLock g_lock(&request_mutex_);
 
-  // Draw from per-client token buckets.
-  if (available_bytes_[client_id] > 0) {
-    int64_t bytes_through = std::min(available_bytes_[client_id], bytes);
-    total_bytes_through_[pri] += bytes_through;
-    available_bytes_[client_id] -= bytes_through;
-    bytes -= bytes_through;
-  } 
-
-  if (bytes == 0) {
-    // Granted!
+  if (stop_) {
     return;
   }
 
