@@ -14,6 +14,9 @@
 #include <chrono>
 #include <deque>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <vector>
 
 #include "port/port.h"
 #include "rocksdb/env.h"
@@ -28,10 +31,10 @@ namespace ROCKSDB_NAMESPACE {
 class MultiTenantRateLimiter : public RateLimiter {
  public:
   MultiTenantRateLimiter(
-    int num_clients, std::vector<int64_t> writes_bytes_per_sec, 
-    std::vector<int64_t> read_bytes_per_sec, int64_t refill_period_us,
-    int32_t fairness, RateLimiter::Mode mode, const std::shared_ptr<SystemClock>& clock, 
-    int64_t single_burst_bytes);
+      int num_clients, std::vector<int64_t> writes_bytes_per_sec,
+      std::vector<int64_t> read_bytes_per_sec, int64_t refill_period_us,
+      int32_t fairness, RateLimiter::Mode mode,
+      const std::shared_ptr<SystemClock>& clock, int64_t single_burst_bytes);
 
   virtual ~MultiTenantRateLimiter();
 
@@ -42,54 +45,32 @@ class MultiTenantRateLimiter : public RateLimiter {
   Status SetSingleBurstBytes(int64_t single_burst_bytes) override;
 
   // Request for token to write bytes. If this request can not be satisfied,
-  // the call is blocked. Caller is responsible to make sure 
+  // the call is blocked. Caller is responsible to make sure
   // bytes <= GetSingleBurstBytes(). Negative bytes passed in will be
   // rounded up to 0.
   using RateLimiter::Request;
   void Request(const int64_t bytes, const Env::IOPriority pri,
                Statistics* stats) override;
   void Request(const int64_t bytes, const Env::IOPriority pri,
-                       Statistics* stats, OpType op_type) override;
-              
+               Statistics* stats, OpType op_type) override;
+
   Status GetTotalPendingRequests(
       int64_t* total_pending_requests,
       const Env::IOPriority pri = Env::IO_TOTAL) const override;
 
-  // TODO(tgriggs): make this per-tenant
+  // TODO: Make this per-tenant
   int64_t GetSingleBurstBytes() const override;
-  int64_t GetSingleBurstBytes(OpType op_type) const override; 
+  int64_t GetSingleBurstBytes(OpType op_type) const override;
 
   int64_t GetTotalBytesThrough(
-      const Env::IOPriority pri = Env::IO_TOTAL) const override {
-    MutexLock g(&request_mutex_);
-    if (pri == Env::IO_TOTAL) {
-      int64_t total_bytes_through_sum = 0;
-      for (int i = Env::IO_LOW; i < Env::IO_TOTAL; ++i) {
-        total_bytes_through_sum += total_bytes_through_[i];
-      }
-      return total_bytes_through_sum;
-    }
-    return total_bytes_through_[pri];
-  }
+      const Env::IOPriority pri = Env::IO_TOTAL) const override;
 
-  int64_t GetTotalBytesThroughForClient(int client_id) const override {
-    return bytes_per_client_[client_id];
-  }
+  int64_t GetTotalBytesThroughForClient(int client_id) const override;
 
   int64_t GetTotalRequests(
-      const Env::IOPriority pri = Env::IO_TOTAL) const override {
-    MutexLock g(&request_mutex_);
-    if (pri == Env::IO_TOTAL) {
-      int64_t total_requests_sum = 0;
-      for (int i = Env::IO_LOW; i < Env::IO_TOTAL; ++i) {
-        total_requests_sum += total_requests_[i];
-      }
-      return total_requests_sum;
-    }
-    return total_requests_[pri];
-  }
+      const Env::IOPriority pri = Env::IO_TOTAL) const override;
 
-  // TODO(tgriggs): Make this per-client? Maybe thread-level storage?
+  // TODO: Make this per-client? Maybe thread-level storage?
   // Only used in [rocksdb/db/db_impl/db_impl_open.cc] to sanitize options
   int64_t GetBytesPerSecond() const override {
     int client_id = 0;
@@ -107,13 +88,17 @@ class MultiTenantRateLimiter : public RateLimiter {
   virtual void TEST_SetClock(std::shared_ptr<SystemClock> clock) {
     MutexLock g(&request_mutex_);
     clock_ = std::move(clock);
-    next_refill_us_ = NowMicrosMonotonicLocked();
+    // Update next refill times for all clients
+    for (int i = 0; i < num_clients_; ++i) {
+      next_refill_us_[i] = NowMicrosMonotonicLocked();
+    }
   }
 
  private:
-  int64_t GetSingleBurstBytes(int client_id) const; 
+  int64_t GetSingleBurstBytes(int client_id) const;
   static constexpr int kMicrosecondsPerSecond = 1000000;
   void RefillBytesAndGrantRequestsLocked();
+  void RefillBytesAndGrantRequestsForClientLocked(int client_id);
   std::vector<Env::IOPriority> GeneratePriorityIterationOrderLocked();
   int64_t CalculateRefillBytesPerPeriodLocked(int64_t rate_bytes_per_sec);
   Status TuneLocked();
@@ -126,7 +111,7 @@ class MultiTenantRateLimiter : public RateLimiter {
     return clock_->NowNanos() / std::milli::den;
   }
 
-  // This mutex guard all internal states
+  // This mutex guards all internal states except per-client states
   mutable port::Mutex request_mutex_;
 
   const int64_t refill_period_us_;
@@ -135,14 +120,13 @@ class MultiTenantRateLimiter : public RateLimiter {
   std::atomic<int64_t> raw_single_burst_bytes_;
   std::shared_ptr<SystemClock> clock_;
 
-  bool stop_;
+  std::atomic<bool> stop_{false};
   port::CondVar exit_cv_;
-  int32_t requests_to_wait_;
+  std::atomic<int32_t> requests_to_wait_{0};
 
+  // Make total_requests_ and total_bytes_through_ atomic
   std::atomic<int64_t> total_requests_[Env::IO_TOTAL];
   std::atomic<int64_t> total_bytes_through_[Env::IO_TOTAL];
-  // int64_t available_bytes_;
-  int64_t next_refill_us_;
 
   int32_t fairness_;
   Random rnd_;
@@ -150,21 +134,32 @@ class MultiTenantRateLimiter : public RateLimiter {
   struct Req;
   struct ReqKey;
 
-  bool wait_until_refill_pending_;
-
   // Multi-tenant extensions
   int num_clients_;
   std::vector<std::atomic<int64_t>> rate_bytes_per_sec_;
   std::vector<std::atomic<int64_t>> refill_bytes_per_period_;
+
+  // available_bytes_ is now a vector of atomic integers
   std::vector<std::atomic<int64_t>> available_bytes_;
+
   std::map<ReqKey, std::deque<Req*>> request_queue_map_;
+
+  // Per-client mutexes for fine-grained locking
+  std::vector<port::Mutex> client_mutexes_;
+
+  // Per-client flags and variables
+  std::vector<std::atomic<bool>> wait_until_refill_pending_;
+  std::vector<int64_t> next_refill_us_;
+
+  // Tracking metrics
   std::vector<int64_t> calls_per_client_;
   std::vector<int64_t> bytes_per_client_;
-  int64_t unassigned_calls_ = 0;
-  int64_t unassigned_bytes_ = 0;
-  int64_t compaction_calls_ = 0;
-  int64_t compaction_bytes_ = 0;
+  std::atomic<int64_t> unassigned_calls_{0};
+  std::atomic<int64_t> unassigned_bytes_{0};
+  std::atomic<int64_t> compaction_calls_{0};
+  std::atomic<int64_t> compaction_bytes_{0};
   int total_calls_;
+
   RateLimiter* read_rate_limiter_ = nullptr;
   RateLimiter::Mode mode_;
 };
