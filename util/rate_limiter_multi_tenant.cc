@@ -282,9 +282,19 @@ void MultiTenantRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
     return;
   }
 
+  // total_requests_[pri] += 1;
+  // int64_t available = available_bytes_[client_id];
+  // if (bytes <= available) {
+  //   bytes = 0;
+  //   available -= bytes;
+  // } else {
+  //   bytes -= available;
+  //   available = 0;
+  // }
+  // available_bytes_[client_id] = available;
+
   total_requests_[pri].fetch_add(1, std::memory_order_relaxed);
 
-  // Attempt to consume available bytes without locking
   int64_t available = available_bytes_[client_id].load(std::memory_order_relaxed);
   if (available > 0) {
     int64_t bytes_to_consume = std::min(available, bytes);

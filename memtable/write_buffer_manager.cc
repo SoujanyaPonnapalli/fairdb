@@ -225,7 +225,7 @@ void WriteBufferManager::BeginWriteStall(StallInterface* wbm_stall, int client_i
   size_t current_total_stalls = total_stall_count_.fetch_add(1, std::memory_order_relaxed) + 1;
 
   // Print stall counts every 100 total stalls
-  if (current_total_stalls % 100 == 0) {
+  if (current_total_stalls % 1000 == 0) {
     std::cout << "Stall counts:" << std::endl;
     for (size_t i = 0; i < per_client_stall_count_.size(); ++i) {
       std::cout << "Client " << i << ": " << per_client_stall_count_[i].load(std::memory_order_relaxed) << " stalls" << std::endl;
