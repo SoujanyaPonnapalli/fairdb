@@ -30,23 +30,31 @@ namespace ROCKSDB_NAMESPACE {
 WriteBufferManager::WriteBufferManager(size_t buffer_size,
                                        std::shared_ptr<Cache> cache,
                                        bool allow_stall,
-                                       size_t num_clients)
+                                       size_t num_clients,
+                                       size_t steady_res_size)
     : buffer_size_(buffer_size),
       mutable_limit_(buffer_size),
-      memory_used_(0),
-      per_client_memory_used_(num_clients),
+      global_size_(buffer_size - steady_res_size),  // Initialize global pool size to buffer size
+      global_used_(0),
+      per_client_global_used_(num_clients),
+      steady_res_size_(steady_res_size),
+      per_client_is_steady_(num_clients, false),
+      steady_res_used_(0),
+      per_client_steady_res_used_(num_clients),
       per_client_buffer_size_(num_clients, buffer_size),
       memory_active_(0),
       cache_res_mgr_(nullptr),
       per_client_queue_(num_clients),
       allow_stall_(allow_stall),
       per_client_stall_active_(num_clients),
-      per_client_stall_count_(num_clients),  // Initialize stall count for clients
+      per_client_stall_count_(num_clients),
       total_stall_count_(0) {
-        
-  std::cout << "[FAIRDB_LOG] WBM Size: " << buffer_size << std::endl;
+  std::cout << "[FAIRDB_LOG] WBM Size: " << (buffer_size / 1024 / 1024) << " MB" << std::endl;
+  std::cout << "[FAIRDB_LOG] Global Pool Size: " << (global_size_ / 1024 / 1024) << " MB" << std::endl;
+  std::cout << "[FAIRDB_LOG] Steady Res Size: " << (steady_res_size_ / 1024 / 1024) << " MB" << std::endl;
   for (size_t i = 0; i < num_clients; ++i) {
-    per_client_memory_used_[i] = 0;
+    per_client_global_used_[i] = 0;
+    per_client_steady_res_used_[i] = 0;
     per_client_stall_active_[i] = false;
     per_client_stall_count_[i] = 0;
   }
@@ -87,30 +95,6 @@ std::size_t WriteBufferManager::dummy_entries_in_cache_usage() const {
   }
 }
 
-void PrintStackTrace() {
-    constexpr int max_frames = 64;
-    void* addrlist[max_frames];
-
-    // Retrieve the current stack addresses
-    int addrlen = backtrace(addrlist, max_frames);
-
-    if (addrlen == 0) {
-        std::cerr << "No stack trace available\n";
-        return;
-    }
-
-    // Convert the addresses into readable symbols
-    char** symbollist = backtrace_symbols(addrlist, addrlen);
-
-    // Print out all the frames
-    std::cout << "Stack trace:\n";
-    for (int i = 0; i < addrlen; ++i) {
-        std::cout << symbollist[i] << '\n';
-    }
-
-    free(symbollist);  // `backtrace_symbols` uses malloc internally
-}
-
 bool WriteBufferManager::ShouldStall(int client_id) const {
   if (client_id < 0) {
     std::cout << "[FAIRDB_LOG] Unaccounted ShouldStall " << client_id << std::endl;
@@ -124,13 +108,67 @@ bool WriteBufferManager::ShouldStall(int client_id) const {
 }
 
 bool WriteBufferManager::IsStallThresholdExceeded(int client_id) const {
-  // return per_client_memory_used_[client_id].load(std::memory_order_relaxed) >= per_client_buffer_size_[client_id];
-  
-  return (per_client_memory_usage(client_id) >= per_client_buffer_size_[client_id]) || (memory_usage() >= buffer_size_);
+  size_t client_total_usage = per_client_memory_usage(client_id);
+
+  // Stall if client's total usage exceeds their buffer size
+  if (client_total_usage >= per_client_buffer_size_[client_id]) {
+    if (per_client_is_steady_[client_id]) {
+      std::cout << "[FAIRDB_LOG] Stalling steady client " << client_id << ". Total usage=" << client_total_usage << std::endl;
+    } else {
+      std::cout << "[FAIRDB_LOG] Stalling NON-steady client " << client_id << ". Total usage=" << client_total_usage << std::endl;
+    }
+    return true;
+  }
+
+  if (per_client_is_steady_[client_id]) {
+    // Steady client: Stall if both global and steady pools are at or above capacity
+    size_t global_used = global_used_.load(std::memory_order_relaxed);
+    bool global_full = global_used >= global_size_;
+    size_t steady_used = steady_res_used_.load(std::memory_order_relaxed);
+    bool steady_full = steady_used >= steady_res_size_;
+    if (global_full && steady_full) {
+      std::cout << "[FAIRDB_LOG] Stalling steady client " << client_id << ". Global=" << global_used << ", Steady=" << steady_used << std::endl;
+    }
+    return global_full && steady_full;
+  } else {
+    // Non-steady client: Stall if global pool is at or above capacity
+    bool should_stall = global_used_.load(std::memory_order_relaxed) >= global_size_;
+    if (should_stall) {
+      std::cout << "[FAIRDB_LOG] Stalling NON-steady client " << client_id << ". Global usage=" << global_used_.load(std::memory_order_relaxed) << std::endl;
+    }
+    return should_stall;
+  }
 }
+
 
 void WriteBufferManager::SetPerClientBufferSize(int client_id, size_t buffer_size) {
   per_client_buffer_size_[client_id] = buffer_size;
+}
+
+void WriteBufferManager::SetSteadyReservationSize(size_t steady_size) {
+  steady_res_size_ = steady_size;
+  global_size_ = buffer_size_.load(std::memory_order_relaxed) - steady_size;
+  assert(global_size_ >= 0);  // Ensure global_size_ is not negative
+}
+
+void WriteBufferManager::SetClientAsSteady(int client_id, bool is_steady) {
+  per_client_is_steady_[client_id] = is_steady;
+}
+
+size_t WriteBufferManager::per_client_global_usage(int client_id) const {
+  return per_client_global_used_[client_id].load(std::memory_order_relaxed);
+}
+
+size_t WriteBufferManager::per_client_steady_usage(int client_id) const {
+  return per_client_steady_res_used_[client_id].load(std::memory_order_relaxed);
+}
+
+size_t WriteBufferManager::aggregate_global_usage() const {
+  return global_used_.load(std::memory_order_relaxed);
+}
+
+size_t WriteBufferManager::aggregate_steady_usage() const {
+  return steady_res_used_.load(std::memory_order_relaxed);
 }
 
 void WriteBufferManager::ReserveMem(size_t mem) {
@@ -139,36 +177,37 @@ void WriteBufferManager::ReserveMem(size_t mem) {
     std::cout << "[FAIRDB_LOG] Unaccounted ReserveMem " << client_id << std::endl;
     return;
   }
+  bool reserved_from_global = false;
   if (cache_res_mgr_ != nullptr) {
     ReserveMemWithCache(mem);
   } else if (enabled()) {
-    memory_used_.fetch_add(mem, std::memory_order_relaxed);
-    per_client_memory_used_[client_id].fetch_add(mem, std::memory_order_relaxed);
+    if (per_client_is_steady_[client_id]) {
+      // Steady client
+      size_t steady_left = steady_res_size_ - steady_res_used_.load(std::memory_order_relaxed);
+      if (steady_left >= mem) {
+        // Allocate from steady pool
+        per_client_steady_res_used_[client_id].fetch_add(mem, std::memory_order_relaxed);
+        steady_res_used_.fetch_add(mem, std::memory_order_relaxed);
+      } else {
+        // Allocate from global pool
+        per_client_global_used_[client_id].fetch_add(mem, std::memory_order_relaxed);
+        global_used_.fetch_add(mem, std::memory_order_relaxed);
+        reserved_from_global = true;
+      }
+    } else {
+      // Non-steady client
+      per_client_global_used_[client_id].fetch_add(mem, std::memory_order_relaxed);
+      global_used_.fetch_add(mem, std::memory_order_relaxed);
+      reserved_from_global = true;
+    }
   }
   if (enabled()) {
     memory_active_.fetch_add(mem, std::memory_order_relaxed);
   }
-  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",res," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
-}
-
-// Should only be called from write thread
-void WriteBufferManager::ReserveMemWithCache(size_t mem) {
-  assert(cache_res_mgr_ != nullptr);
-  std::cout << "[FAIRDB_LOG] Surprise! ReserveMemWithCache was called.\n";
-  // Use a mutex to protect various data structures. Can be optimized to a
-  // lock-free solution if it ends up with a performance bottleneck.
-  std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
-
-  size_t new_mem_used = memory_usage() + mem;
-  memory_used_.store(new_mem_used, std::memory_order_relaxed);
-  Status s = cache_res_mgr_->UpdateCacheReservation(new_mem_used);
-
-  // We absorb the error since WriteBufferManager is not able to handle
-  // this failure properly. Ideallly we should prevent this allocation
-  // from happening if this cache charging fails.
-  // [TODO] We'll need to improve it in the future and figure out what to do on
-  // error
-  s.PermitUncheckedError();
+  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count()
+               << "," << client_id << ",res," << mem << ","
+               << per_client_memory_usage(client_id) << "," << (reserved_from_global ? "global" : "steady") << std::endl;
 }
 
 void WriteBufferManager::ScheduleFreeMem(size_t mem) {
@@ -183,19 +222,79 @@ void WriteBufferManager::FreeMem(size_t mem) {
     std::cout << "[FAIRDB_LOG] Unaccounted FreeMem " << client_id << std::endl;
     return;
   }
+  size_t freed_from_global = 0;
+  size_t freed_from_steady = 0;
   if (cache_res_mgr_ != nullptr) {
     FreeMemWithCache(mem);
   } else if (enabled()) {
-    size_t current_memory = memory_used_.load(std::memory_order_relaxed);
-    memory_used_.store(current_memory >= mem ? current_memory - mem : 0, std::memory_order_relaxed);
+    if (per_client_is_steady_[client_id]) {
+      // Steady client
+      size_t client_global_usage = per_client_global_used_[client_id].load(std::memory_order_relaxed);
+      size_t free_from_global = std::min(mem, client_global_usage);
+      freed_from_global = free_from_global;
 
-    size_t client_memory = per_client_memory_used_[client_id].load(std::memory_order_relaxed);
-    per_client_memory_used_[client_id].store(client_memory >= mem ? client_memory - mem : 0, std::memory_order_relaxed);
+      // Avoid underflow when freeing global memory
+      per_client_global_used_[client_id].store(
+          client_global_usage >= free_from_global ? 
+          client_global_usage - free_from_global : 0, 
+          std::memory_order_relaxed);
+      global_used_.store(
+          global_used_.load(std::memory_order_relaxed) >= free_from_global ? 
+          global_used_.load(std::memory_order_relaxed) - free_from_global : 0, 
+          std::memory_order_relaxed);
+
+      size_t remaining_mem = mem - free_from_global;
+      freed_from_steady = remaining_mem;
+
+      if (remaining_mem > 0) {
+        // Free from steady reservation, avoiding underflow
+        size_t client_steady_usage = per_client_steady_res_used_[client_id].load(std::memory_order_relaxed);
+        per_client_steady_res_used_[client_id].store(
+            client_steady_usage >= remaining_mem ? 
+            client_steady_usage - remaining_mem : 0, 
+            std::memory_order_relaxed);
+        steady_res_used_.store(
+            steady_res_used_.load(std::memory_order_relaxed) >= remaining_mem ? 
+            steady_res_used_.load(std::memory_order_relaxed) - remaining_mem : 0, 
+            std::memory_order_relaxed);
+      }
+    } else {
+      // Non-steady client
+      size_t client_global_usage = per_client_global_used_[client_id].load(std::memory_order_relaxed);
+      per_client_global_used_[client_id].store(
+          client_global_usage >= mem ? 
+          client_global_usage - mem : 0, 
+          std::memory_order_relaxed);
+      global_used_.store(
+          global_used_.load(std::memory_order_relaxed) >= mem ? 
+          global_used_.load(std::memory_order_relaxed) - mem : 0, 
+          std::memory_order_relaxed);
+      freed_from_global = mem;
+    }
   }
-  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "," << client_id << ",free," << mem << "," << per_client_memory_used_[client_id].load(std::memory_order_relaxed) << std::endl;
+  mt_log_file_ << "wbm," << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count()
+               << "," << client_id << ",free," << mem << ","
+               << per_client_memory_usage(client_id) << ",global:" << freed_from_global << ",steady:" << freed_from_steady << std::endl;
 
   // Check if stall is active and can be ended.
   MaybeEndWriteStall();
+}
+
+void WriteBufferManager::ReserveMemWithCache(size_t mem) {
+  assert(cache_res_mgr_ != nullptr);
+  std::cout << "[FAIRDB_LOG] Surprise! ReserveMemWithCache was called.\n";
+  // Use a mutex to protect various data structures. Can be optimized to a
+  // lock-free solution if it ends up with a performance bottleneck.
+  std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
+
+  size_t new_mem_used = memory_usage() + mem;
+  Status s = cache_res_mgr_->UpdateCacheReservation(new_mem_used);
+
+  // We absorb the error since WriteBufferManager is not able to handle
+  // this failure properly. Ideally we should prevent this allocation
+  // from happening if this cache charging fails.
+  s.PermitUncheckedError();
 }
 
 void WriteBufferManager::FreeMemWithCache(size_t mem) {
@@ -204,9 +303,7 @@ void WriteBufferManager::FreeMemWithCache(size_t mem) {
 
   std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
 
-  size_t current_memory = memory_usage();
-  size_t new_mem_used = current_memory >= mem ? current_memory - mem : 0;
-  memory_used_.store(new_mem_used, std::memory_order_relaxed);
+  size_t new_mem_used = memory_usage() >= mem ? memory_usage() - mem : 0;
 
   Status s = cache_res_mgr_->UpdateCacheReservation(new_mem_used);
 
@@ -221,13 +318,11 @@ void WriteBufferManager::BeginWriteStall(StallInterface* wbm_stall, int client_i
     std::cout << "[FAIRDB_LOG] Unaccounted BeginWriteStall " << client_id << std::endl;
     return;
   }
-  // Allocate outside of the lock.
-
   // Increment the stall count for the client atomically
   per_client_stall_count_[client_id].fetch_add(1, std::memory_order_relaxed);
   size_t current_total_stalls = total_stall_count_.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  // Print stall counts every 100 total stalls
+  // Print stall counts every 1000 total stalls
   if (current_total_stalls % 1000 == 0) {
     std::cout << "Stall counts:" << std::endl;
     for (size_t i = 0; i < per_client_stall_count_.size(); ++i) {

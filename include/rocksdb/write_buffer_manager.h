@@ -54,7 +54,8 @@ class WriteBufferManager final {
   explicit WriteBufferManager(size_t buffer_size,
                               std::shared_ptr<Cache> cache = {},
                               bool allow_stall = true,
-                              size_t num_clients = 16);
+                              size_t num_clients = 16, 
+                              size_t steady_res_size = 0);
 
   // No copying allowed
   WriteBufferManager(const WriteBufferManager&) = delete;
@@ -72,12 +73,14 @@ class WriteBufferManager final {
   // Returns the total memory used by memtables.
   // Only valid if enabled()
   size_t memory_usage() const {
-    return memory_used_.load(std::memory_order_relaxed);
+    return global_used_.load(std::memory_order_relaxed) +
+           steady_res_used_.load(std::memory_order_relaxed);
   }
 
   // Returns the per-client memory usage.
   size_t per_client_memory_usage(int client_id) const {
-    return per_client_memory_used_[client_id].load(std::memory_order_relaxed);
+    return per_client_global_used_[client_id].load(std::memory_order_relaxed) +
+           per_client_steady_res_used_[client_id].load(std::memory_order_relaxed);
   }
 
   // Returns the total memory used by active memtables.
@@ -93,17 +96,37 @@ class WriteBufferManager final {
   }
 
   size_t num_clients() const {
-    return per_client_memory_used_.size();
+    return per_client_global_used_.size();
   }
 
   // Sets the per-client buffer size (memory usage threshold) for stalling.
   void SetPerClientBufferSize(int client_id, size_t buffer_size);
+
+  // Set the steady reservation size and adjust global pool size accordingly.
+  void SetSteadyReservationSize(size_t steady_size);
+
+  // Mark a client as steady or non-steady.
+  void SetClientAsSteady(int client_id, bool is_steady);
+
+  // Get per-client global pool usage.
+  size_t per_client_global_usage(int client_id) const;
+
+  // Get per-client steady pool usage.
+  size_t per_client_steady_usage(int client_id) const;
+
+  // Get aggregate global pool usage.
+  size_t aggregate_global_usage() const;
+
+  // Get aggregate steady pool usage.
+  size_t aggregate_steady_usage() const;
 
   // REQUIRED: `new_size` > 0
   void SetBufferSize(size_t new_size) {
     assert(new_size > 0);
     buffer_size_.store(new_size, std::memory_order_relaxed);
     mutable_limit_.store(new_size * 7 / 8, std::memory_order_relaxed);
+    // Adjust global and steady pool sizes
+    global_size_ = buffer_size_ - steady_res_size_;
     // Check if stall is active and can be ended.
     MaybeEndWriteStall();
   }
@@ -116,24 +139,23 @@ class WriteBufferManager final {
   // Below functions should be called by RocksDB internally.
 
   // Should only be called from write thread
-bool ShouldFlush() const {
-  if (enabled()) {
-    if (mutable_memtable_memory_usage() >
-        mutable_limit_.load(std::memory_order_relaxed)) {
-      return true;
-    }
-    size_t local_size = buffer_size();
-    if (memory_usage() >= local_size &&
-        mutable_memtable_memory_usage() >= local_size / 2) {
+  bool ShouldFlush() const {
+    if (enabled()) {
+      if (mutable_memtable_memory_usage() >
+          mutable_limit_.load(std::memory_order_relaxed)) {
+        return true;
+      }
+      size_t local_size = buffer_size();
+      if (memory_usage() >= local_size &&
+          mutable_memtable_memory_usage() >= local_size / 2) {
       // If the memory exceeds the buffer size, we trigger more aggressive
       // flush. But if already more than half memory is being flushed,
       // triggering more flush may not help. We will hold it instead.
-      return true;
+        return true;
+      }
     }
+    return false;
   }
-  return false;
-}
-
 
   // Returns true if total memory usage exceeded buffer_size.
   // We stall the writes until memory_usage drops below buffer_size. When the
@@ -173,16 +195,26 @@ bool ShouldFlush() const {
  private:
   std::atomic<size_t> buffer_size_;
   std::atomic<size_t> mutable_limit_;
-  std::atomic<size_t> memory_used_;
-  std::vector<std::atomic<size_t>> per_client_memory_used_;
+
+  // Global Pool
+  size_t global_size_;
+  std::atomic<size_t> global_used_;
+  std::vector<std::atomic<size_t>> per_client_global_used_;
+
+  // Steady Reservation Pool
+  size_t steady_res_size_;
+  std::vector<bool> per_client_is_steady_;
+  std::atomic<size_t> steady_res_used_;
+  std::vector<std::atomic<size_t>> per_client_steady_res_used_;
+
   std::vector<size_t> per_client_buffer_size_;
-  // Memory that hasn't been scheduled to free.
+
   std::atomic<size_t> memory_active_;
   std::shared_ptr<CacheReservationManager> cache_res_mgr_;
-  // Protects cache_res_mgr_
   std::mutex cache_res_mgr_mu_;
 
   std::vector<std::list<StallInterface*>> per_client_queue_;
+  
   // Protects the per-client queues and stall_active_ flags.
   std::mutex mu_;
   std::atomic<bool> allow_stall_;
@@ -194,7 +226,6 @@ bool ShouldFlush() const {
 
   std::vector<std::atomic<size_t>> per_client_stall_count_;
   std::atomic<int> total_stall_count_;
-
 
   void ReserveMemWithCache(size_t mem);
   void FreeMemWithCache(size_t mem);
