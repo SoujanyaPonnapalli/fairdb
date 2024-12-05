@@ -130,7 +130,7 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
       FairDBCacheMetadata* meta = caches_iterator->second;
       meta->reserved_capacity = current_reservation_standard_;
     }
-    printf("Added an active user. Number of active users now is %d. The reserved capacity standard now is %d\n", M, current_reservation_standard_);
+    printf("Added an active user. Number of active users now is %ld. The reserved capacity standard now is %ld\n", M, current_reservation_standard_);
   }
 }
 
