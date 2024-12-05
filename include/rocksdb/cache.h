@@ -288,7 +288,7 @@ struct LRUCacheOptions : public ShardedCacheOptions {
 
   // Construct an instance of LRUCache for use as a row cache, typically for
   // `DBOptions::row_cache`. Some options are not relevant to row caches.
-  std::shared_ptr<RowCache> MakeSharedRowCache() const;
+std::shared_ptr<RowCache> MakeSharedRowCache() const;
 };
 
 // DEPRECATED wrapper function
