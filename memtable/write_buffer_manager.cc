@@ -124,9 +124,9 @@ bool WriteBufferManager::ShouldStall(int client_id) const {
 }
 
 bool WriteBufferManager::IsStallThresholdExceeded(int client_id) const {
-    return per_client_memory_used_[client_id].load(std::memory_order_relaxed) >= per_client_buffer_size_[client_id];
-
-  // return (per_client_memory_usage(client_id) >= per_client_buffer_size_[client_id]) || (memory_usage() >= buffer_size_);
+  // return per_client_memory_used_[client_id].load(std::memory_order_relaxed) >= per_client_buffer_size_[client_id];
+  
+  return (per_client_memory_usage(client_id) >= per_client_buffer_size_[client_id]) || (memory_usage() >= buffer_size_);
 }
 
 void WriteBufferManager::SetPerClientBufferSize(int client_id, size_t buffer_size) {
@@ -154,6 +154,7 @@ void WriteBufferManager::ReserveMem(size_t mem) {
 // Should only be called from write thread
 void WriteBufferManager::ReserveMemWithCache(size_t mem) {
   assert(cache_res_mgr_ != nullptr);
+  std::cout << "[FAIRDB_LOG] Surprise! ReserveMemWithCache was called.\n";
   // Use a mutex to protect various data structures. Can be optimized to a
   // lock-free solution if it ends up with a performance bottleneck.
   std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
@@ -199,6 +200,8 @@ void WriteBufferManager::FreeMem(size_t mem) {
 
 void WriteBufferManager::FreeMemWithCache(size_t mem) {
   assert(cache_res_mgr_ != nullptr);
+  std::cout << "[FAIRDB_LOG] Surprise! FreeMemWithCache was called.\n";
+
   std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
 
   size_t current_memory = memory_usage();
