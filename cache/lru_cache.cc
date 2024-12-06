@@ -95,7 +95,7 @@ size_t LRUCacheManager::DecrementAllocation (int client_id, size_t capacity) {
   }
 }
 
-void LRUCacheManager::MarkActiveUser (int client_id) {
+void LRUCacheManager::MarkActiveUser(int client_id) {
   // TODO (devbali): Implement a way to have user be deactivated too
   if (client_id == -1) return;
 
@@ -125,12 +125,13 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
     } else {
       current_reservation_standard_ = reserved_needed;
     }
+    std::cout << TOTAL << ", " << N << ", " <<  request_additional_delay_microseconds<< ", " << read_io_mbps << ", " << M << ", "<< K << ", "<< (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / (M + K) << ", "<< reserved_needed << "\n";
     
     for (auto caches_iterator = caches->begin(); caches_iterator != caches->end(); ++caches_iterator) {
       FairDBCacheMetadata* meta = caches_iterator->second;
       meta->reserved_capacity = current_reservation_standard_;
     }
-    printf("Added an active user. Number of active users now is %ld. The reserved capacity standard now is %ld\n", M, current_reservation_standard_);
+    printf("Added an active user. Number of active users now is %ld. The reserved capacity standard now is %ld based on RAD: %ld\n", M, current_reservation_standard_, request_additional_delay_microseconds);
   }
 }
 
