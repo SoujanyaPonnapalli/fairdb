@@ -1,6 +1,7 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
+<<<<<<< HEAD
 ## 10.4.2 (07/09/2025)
 ### Bug Fixes
 * Fix a race condition between concurrent DB::Open sharing the same SstFileManager instance.
@@ -88,6 +89,13 @@ system's prefetch) on SST file during compaction read
 
 ### Bug Fixes
 * Fixed stats for Tiered Storage with preclude_last_level feature
+=======
+## 10.1.0 (03/05/2025)
+### Public API Changes
+* Add an unordered map of name/value pairs, ReadOptions::property_bag, to pass opaque options through to an external table when creating an Iterator.
+* Introduced CompactionServiceJobStatus::kAborted to allow handling aborted scenario in Schedule(), Wait() or OnInstallation() APIs in Remote Compactions.
+* Added a column family option disallow_memtable_writes to safely fail any attempts to write to a non-default column family. This can be used for column families that are ingest only.
+>>>>>>> 6fff8f684 (Update HISTORY and version to 10.1.0)
 
 ## 10.0.0 (02/21/2025)
 ### New Features
