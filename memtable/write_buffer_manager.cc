@@ -24,6 +24,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <filesystem>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -68,10 +69,15 @@ WriteBufferManager::WriteBufferManager(size_t buffer_size,
         cache, true /* delayed_decrease */);
   }
 
-  mt_log_file_.open("logs/memtable_stats.txt", std::ios::out | std::ios::trunc);
+  std::string log_file_path = "logs/memtable_stats.txt";
+  
+  // Create logs directory if it doesn't exist
+  std::filesystem::create_directories("logs");
+  
+  mt_log_file_.open(log_file_path, std::ios::out | std::ios::trunc);
   // Ensure log file is open and ready for use
   if (!mt_log_file_.is_open()) {
-    throw std::ios_base::failure("Failed to open log/memtable_stats.txt");
+    throw std::ios_base::failure("Failed to open " + log_file_path);
   }
 }
 
@@ -111,7 +117,7 @@ bool WriteBufferManager::IsStallThresholdExceeded(int client_id) const {
   size_t client_total_usage = per_client_memory_usage(client_id);
 
   // Stall if client's total usage exceeds their buffer size
-  if (client_total_usage >= per_client_buffer_size_[client_id]) {
+  if (client_total_usage > per_client_buffer_size_[client_id]) {
     if (per_client_is_steady_[client_id]) {
       std::cout << "[FAIRDB_LOG] Stalling steady client " << client_id << ". Total usage=" << client_total_usage << std::endl;
     } else {
