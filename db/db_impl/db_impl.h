@@ -2835,6 +2835,28 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_;
+
+  std::ofstream WALlogFile;
+  std::mutex logMutex;
+
+  void init_WAL_logging() {
+    WALlogFile.open("logs/WAL_logs.csv");
+    if (!WALlogFile.is_open()) {
+      std::cerr << "Failed to open WAL log file" << std::endl;
+    }
+  }
+
+  void WAL_log(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (!WALlogFile.is_open()) {
+      init_WAL_logging();
+    }
+    WALlogFile << msg << std::endl;
+  }
+
+  void close_WAL_logging() {
+    WALlogFile.close();
+  }
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {
