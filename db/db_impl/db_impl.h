@@ -2838,6 +2838,7 @@ class DBImpl : public DB {
 
   std::ofstream WALlogFile;
   std::mutex logMutex;
+  long long lastLoggedTimestamp = -1;
 
   void init_WAL_logging() {
     WALlogFile.open("logs/WAL_logs.csv");
@@ -2846,16 +2847,36 @@ class DBImpl : public DB {
     }
   }
 
-  void WAL_log(const std::string& msg) {
+  void WAL_log(const std::string& msg, long long timestamp, std::string operation) {
+    if (timestamp <= lastLoggedTimestamp && operation == "write") {
+      return;
+    }
     std::lock_guard<std::mutex> lock(logMutex);
     if (!WALlogFile.is_open()) {
       init_WAL_logging();
     }
-    WALlogFile << msg << std::endl;
+    if (timestamp > lastLoggedTimestamp || operation != "write") {
+      lastLoggedTimestamp = timestamp;
+      WALlogFile << msg << std::endl;
+    }
   }
 
   void close_WAL_logging() {
     WALlogFile.close();
+  }
+
+  long atomic_counter = 0;
+  std::mutex atomic_counter_mutex;
+
+  void increment_atomic_counter() {
+    atomic_counter++;
+  }
+
+  long get_atomic_counter() {
+    std::lock_guard<std::mutex> lock(atomic_counter_mutex);
+    long counter = atomic_counter;
+    increment_atomic_counter();
+    return counter;
   }
 };
 

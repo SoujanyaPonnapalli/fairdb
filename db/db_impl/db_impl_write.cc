@@ -1444,13 +1444,14 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   log_file_number_size.AddSize(*log_size);
   log_empty_ = false;
   std::ostringstream oss;
+  long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   oss << "write,"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ","
+      << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize();
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
-  WAL_log(oss.str());
+  WAL_log(oss.str(), timestamp, "write");
   return io_s;
 }
 
@@ -1559,13 +1560,14 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
   }
   std::ostringstream oss;
+  long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   oss << "write,"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ","
+      << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize();
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
-  WAL_log(oss.str());
+  WAL_log(oss.str(), timestamp, "write");
   return io_s;
 }
 
@@ -1631,13 +1633,14 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
   }
   std::ostringstream oss;
+  long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   oss << "write,"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ","
+      << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize();
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
-  WAL_log(oss.str());
+  WAL_log(oss.str(), timestamp, "write");
   return io_s;
 }
 
@@ -1751,14 +1754,18 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     return status;
   }
 
+  long switch_count = get_atomic_counter();
+
   std::ostringstream oss;
+  long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   oss << "switch_start,"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ","
+      << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize();
+      << GetMaxTotalWalSize() << ","
+      << switch_count;
   
   // Log the formatted string
-  WAL_log(oss.str());
+  WAL_log(oss.str(), timestamp, "switch_start");
 
   auto oldest_alive_log = alive_log_files_.begin()->number;
   bool flush_wont_release_oldest_log = false;
@@ -1851,13 +1858,15 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     MaybeScheduleFlushOrCompaction();
   }
   std::ostringstream oss2;
-  oss2 << "switch_finish,"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ","
+  timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  oss2 << "switch_end,"
+      << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize();
+      << GetMaxTotalWalSize() << ","
+      << switch_count;
   
   // Log the formatted string
-  WAL_log(oss2.str());
+  WAL_log(oss2.str(), timestamp, "switch_end");
   return status;
 }
 
