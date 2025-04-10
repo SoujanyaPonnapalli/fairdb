@@ -563,6 +563,23 @@ class MemTable {
                                     uint32_t protection_bytes_per_key,
                                     bool allow_data_in_errors = false);
 
+
+  // Adds size to the corresponding log file number in the log_file_size_map_.
+  // If it does not exist, it will be created.
+  void AddWALAttribution(uint64_t log_file_number, uint64_t size) {
+    auto it = log_file_size_map_.find(log_file_number);
+    if (it == log_file_size_map_.end()) {
+      log_file_size_map_[log_file_number] = size;
+    } else {
+      it->second += size;
+    }
+  }
+
+  std::map<uint64_t, uint64_t> GetAttributionMap() {
+    return log_file_size_map_;
+  }
+  
+
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
 
@@ -609,6 +626,11 @@ class MemTable {
 
   // The log files earlier than this number can be deleted.
   uint64_t mem_next_logfile_number_;
+
+  // Map from log file number to the size attribution of the memtable
+  // to the log file. This is used to track the size of the memtable
+
+  std::map<uint64_t, uint64_t> log_file_size_map_;
 
   // the earliest log containing a prepared section
   // which has been inserted into this memtable.

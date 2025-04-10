@@ -470,6 +470,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
   IOStatus io_s;
   Status pre_release_cb_status;
+  WALWriteData wal_write_data;
   if (status.ok()) {
     // Rules for when we can update the memtable concurrently
     // 1. supported by memtable
@@ -563,7 +564,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         io_s =
             WriteToWAL(write_group, log_context.writer, log_used,
                        log_context.need_log_sync, log_context.need_log_dir_sync,
-                       last_sequence + 1, log_file_number_size);
+                       last_sequence + 1, log_file_number_size, &wal_write_data);
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {
@@ -711,6 +712,30 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           assert(tmp_s.ok());
         }
       }
+      std::map<std::pair<MemTable*, ColumnFamilyData*>, uint64_t> memtable_write_counts;
+      uint64_t total_writes = 0;
+      
+      for (auto* writer : write_group) {
+        for (const auto& [key, count] : writer->GetMemtableWriteCountMap()) {
+          memtable_write_counts[key] += count;
+          total_writes += count;
+        }
+      }
+      
+      // Get total WAL write size
+      uint64_t log_number = wal_write_data.log_number;
+      uint64_t log_size = wal_write_data.write_size;
+      
+      // Perform proportional attribution
+      for (const auto& [key, count] : memtable_write_counts) {
+        MemTable* memtable = key.first;
+        ColumnFamilyData* cfd = key.second;
+      
+        double proportion = static_cast<double>(count) / total_writes;
+        uint64_t attributed_bytes = static_cast<uint64_t>(proportion * log_size);
+      
+        AddWALAttribution(log_number, attributed_bytes, memtable, cfd);
+      }
       // Note: if we are to resume after non-OK statuses we need to revisit how
       // we reacts to non-OK statuses here.
       versions_->SetLastSequence(last_sequence);
@@ -814,10 +839,11 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       assert(log_context.log_file_number_size);
       LogFileNumberSize& log_file_number_size =
           *(log_context.log_file_number_size);
+      WALWriteData wal_write_data;
       io_s =
           WriteToWAL(wal_write_group, log_context.writer, log_used,
                      log_context.need_log_sync, log_context.need_log_dir_sync,
-                     current_sequence, log_file_number_size);
+                     current_sequence, log_file_number_size, &wal_write_data);
       w.status = io_s;
     }
 
@@ -1406,7 +1432,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
                             log::Writer* log_writer, uint64_t* log_used,
                             uint64_t* log_size,
-                            LogFileNumberSize& log_file_number_size) {
+                            LogFileNumberSize& log_file_number_size, WALWriteData* wdata) {
   assert(log_size != nullptr);
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
@@ -1448,10 +1474,14 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << ",";
+      << GetMaxTotalWalSize() << "," <<
+      immutable_db_options().atomic_flush << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
+
+  wdata->log_number = logfile_number_;
+  wdata->write_size = log_entry.size();
   return io_s;
 }
 
@@ -1459,7 +1489,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
                             log::Writer* log_writer, uint64_t* log_used,
                             bool need_log_sync, bool need_log_dir_sync,
                             SequenceNumber sequence,
-                            LogFileNumberSize& log_file_number_size) {
+                            LogFileNumberSize& log_file_number_size, WALWriteData* wdata) {
   IOStatus io_s;
   assert(!two_write_queues_);
   assert(!write_group.leader->disable_wal);
@@ -1490,7 +1520,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
-                    &log_size, log_file_number_size);
+                    &log_size, log_file_number_size, wdata);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -1564,7 +1594,8 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << ",";
+      << GetMaxTotalWalSize() << "," <<
+      immutable_db_options().atomic_flush << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
@@ -1614,8 +1645,9 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
+  WALWriteData wdata;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
-                    &log_size, log_file_number_size);
+                    &log_size, log_file_number_size, &wdata);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -1637,7 +1669,8 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << ",";
+      << GetMaxTotalWalSize() << "," <<
+      immutable_db_options().atomic_flush << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
@@ -1754,18 +1787,15 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     return status;
   }
 
-  long switch_count = get_atomic_counter();
-
   std::ostringstream oss;
   long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  oss << "switch_start,"
+  oss << "switch,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << ","
-      << switch_count;
+      << GetMaxTotalWalSize();
   
   // Log the formatted string
-  WAL_log(oss.str(), timestamp, "switch_start");
+  WAL_log(oss.str(), timestamp, "switch");
 
   auto oldest_alive_log = alive_log_files_.begin()->number;
   bool flush_wont_release_oldest_log = false;
@@ -1857,16 +1887,6 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     }
     MaybeScheduleFlushOrCompaction();
   }
-  std::ostringstream oss2;
-  timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  oss2 << "switch_end,"
-      << timestamp << ","
-      << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << ","
-      << switch_count;
-  
-  // Log the formatted string
-  WAL_log(oss2.str(), timestamp, "switch_end");
   return status;
 }
 
@@ -2399,6 +2419,15 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
       log_dir_synced_ = false;
       logs_.emplace_back(logfile_number_, new_log);
       alive_log_files_.emplace_back(logfile_number_);
+      std::ostringstream oss;
+      long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      oss << "add_log,"
+          << timestamp << ","
+          << total_log_size_.load() << ","
+          << GetMaxTotalWalSize();
+      
+      // Log the formatted string
+      WAL_log(oss.str(), timestamp, "add_log");
     }
   }
 

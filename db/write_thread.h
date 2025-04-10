@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "db/memtable.h"
 #include "db/post_memtable_callback.h"
 #include "db/pre_release_callback.h"
 #include "db/write_callback.h"
@@ -139,6 +140,8 @@ class WriteThread {
     Writer* link_older;  // read/write only before linking, or as leader
     Writer* link_newer;  // lazy, read/write only before linking, or as leader
 
+    std::map<std::pair<MemTable*, ColumnFamilyData*>, std::atomic<uint64_t>> memtable_write_count_map_;
+
     Writer()
         : batch(nullptr),
           sync(false),
@@ -257,6 +260,10 @@ class WriteThread {
       assert(made_waitable);
       return *static_cast<std::condition_variable*>(
           static_cast<void*>(&state_cv_bytes));
+    }
+
+    std::map<std::pair<MemTable*, ColumnFamilyData*>, std::atomic<uint64_t>>& GetMemtableWriteCountMap() {
+      return memtable_write_count_map_;
     }
   };
 

@@ -567,6 +567,10 @@ class ColumnFamilyData {
   // Recover the next epoch number of this CF and epoch number
   // of its files (if missing)
   void RecoverEpochNumbers();
+  
+  void AddWALAttribution(uint64_t attribution) {
+    cf_total_wal_attribution_ += attribution;
+  }
 
  private:
   friend class ColumnFamilySet;
@@ -669,6 +673,9 @@ class ColumnFamilyData {
   bool mempurge_used_;
 
   std::atomic<uint64_t> next_epoch_number_;
+
+  // Size in WAL attributed to this CF
+  uint64_t cf_total_wal_attribution_;
 };
 
 // ColumnFamilySet has interesting thread-safety requirements

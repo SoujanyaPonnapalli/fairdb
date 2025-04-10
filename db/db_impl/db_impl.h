@@ -1667,6 +1667,8 @@ class DBImpl : public DB {
     uint64_t number;
     uint64_t size = 0;
     bool getting_flushed = false;
+    // map from memtable to size attributable to that memtable
+    std::map<MemTable*, uint64_t> memtable_size_map;
   };
 
   struct LogWriterNumber {
@@ -2087,17 +2089,22 @@ class DBImpl : public DB {
                     WriteBatch* tmp_batch, WriteBatch** merged_batch,
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
+  struct WALWriteData {
+    uint64_t log_number;
+    uint64_t write_size;
+  };
+
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
                       log::Writer* log_writer, uint64_t* log_used,
                       uint64_t* log_size,
-                      LogFileNumberSize& log_file_number_size);
+                      LogFileNumberSize& log_file_number_size, WALWriteData* data);
 
   IOStatus WriteToWAL(const WriteThread::WriteGroup& write_group,
                       log::Writer* log_writer, uint64_t* log_used,
                       bool need_log_sync, bool need_log_dir_sync,
                       SequenceNumber sequence,
-                      LogFileNumberSize& log_file_number_size);
+                      LogFileNumberSize& log_file_number_size, WALWriteData* data);
 
   IOStatus ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
                                 uint64_t* log_used,
@@ -2835,6 +2842,47 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_;
+
+  // Guards attribution operations
+  InstrumentedMutex attribution_mutex_;
+
+  // Total WAL attribution for the database
+  u_int64_t total_wal_attribution = 0;
+
+  // Adds WAL attribution for the given memtable and log 
+  // file to the memtable, column family, database, and WAL
+  void AddWALAttribution(
+    const uint64_t log_number, const uint64_t log_size,
+    MemTable* memtable, ColumnFamilyData* cfd) {
+      // Lock attribution mutex
+      InstrumentedMutexLock lock(&attribution_mutex_);
+      total_wal_attribution += log_size;
+      memtable->AddWALAttribution(log_number, log_size);
+      cfd->AddWALAttribution(log_size);
+
+      // Get wal number size struct corresponding to log_number in alive_log_files_
+      auto it = std::find_if(alive_log_files_.begin(), alive_log_files_.end(),
+                             [log_number](const LogFileNumberSize& log_file) {
+                               return log_file.number == log_number;
+                             });
+
+      // Error handling if log number not found
+      if (it == alive_log_files_.end()) {
+        std::cerr << "Log number not found in alive_log_files_" << std::endl;
+        return;
+      }
+
+      // Update the map inside the LogFileNumberSize struct with the memtable* to size mapping. 
+      // If the memtable* is not found, it will be added with the log size.
+      auto& log_file = *it;
+      auto memtable_it = log_file.memtable_size_map.find(memtable);
+      if (memtable_it != log_file.memtable_size_map.end()) {
+        memtable_it->second += log_size;
+      } else {
+        log_file.memtable_size_map[memtable] = log_size;
+      }
+    }
+
 
   std::ofstream WALlogFile;
   std::mutex logMutex;

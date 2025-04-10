@@ -1883,6 +1883,8 @@ class MemTableInserter : public WriteBatch::Handler {
   const WriteBatch::ProtectionInfo* prot_info_;
   size_t prot_info_idx_;
 
+  std::map<std::pair<MemTable*, ColumnFamilyData*>, std::atomic<uint64_t>> write_count_map_;
+
   bool* has_valid_writes_;
   // On some (!) platforms just default creating
   // a map is too expensive in the Write() path as they
@@ -2058,6 +2060,17 @@ class MemTableInserter : public WriteBatch::Handler {
     prot_info_ = prot_info;
     prot_info_idx_ = 0;
   }
+
+  std::map<std::pair<MemTable*, ColumnFamilyData*>, std::atomic<uint64_t>>& GetCountMap() {
+    return write_count_map_;
+  }
+
+  // Clear the write count map
+  void ClearCountMap() {
+    write_count_map_.clear();
+  }
+  
+  
 
   SequenceNumber sequence() const { return sequence_; }
 
@@ -2293,6 +2306,15 @@ class MemTableInserter : public WriteBatch::Handler {
     if (UNLIKELY(ret_status.IsTryAgain())) {
       DecrementProtectionInfoIdxForTryAgain();
     }
+    // Find the column family for the memtable and increment the write count
+    // for the memtable in the write count map
+    auto cf_handle = cf_mems_->current();
+    if (cf_handle != nullptr) {
+      auto mem = cf_mems_->GetMemTable();
+      auto& write_count = write_count_map_[{mem, cf_handle}];
+      write_count++;
+    }
+  
     return ret_status;
   }
 
@@ -3099,6 +3121,18 @@ Status WriteBatchInternal::InsertInto(
     }
     assert(!seq_per_batch || w->batch_cnt != 0);
     assert(!seq_per_batch || inserter.sequence() - w->sequence == w->batch_cnt);
+
+    auto& writer_map = w->GetMemtableWriteCountMap();
+    for (const auto& entry : inserter.GetCountMap()) {
+      auto it = writer_map.find(entry.first);
+      if (it != writer_map.end()) {
+        it->second += entry.second;
+      } else {
+        writer_map[entry.first] = entry.second.load();
+      }
+    }
+
+    inserter.ClearCountMap();
   }
   return Status::OK();
 }
@@ -3126,10 +3160,16 @@ Status WriteBatchInternal::InsertInto(
   Status s = writer->batch->Iterate(&inserter);
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
-  if (concurrent_memtable_writes) {
-    inserter.PostProcess();
+
+  auto& writer_map = writer->GetMemtableWriteCountMap();
+  for (const auto& entry : inserter.GetCountMap()) {
+    auto it = writer_map.find(entry.first);
+    if (it != writer_map.end()) {
+      it->second += entry.second;
+    } else {
+      writer_map[entry.first] = entry.second.load();
+    }
   }
-  return s;
 }
 
 Status WriteBatchInternal::InsertInto(

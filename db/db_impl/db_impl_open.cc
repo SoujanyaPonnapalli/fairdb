@@ -2055,10 +2055,12 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         log::Writer* log_writer = impl->logs_.back().writer;
         LogFileNumberSize& log_file_number_size = impl->alive_log_files_.back();
 
+        WALWriteData log_used_data;
+
         assert(log_writer->get_log_number() == log_file_number_size.number);
         impl->mutex_.AssertHeld();
         s = impl->WriteToWAL(empty_batch, write_options, log_writer, &log_used,
-                             &log_size, log_file_number_size);
+                             &log_size, log_file_number_size, &log_used_data);
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(write_options, false);

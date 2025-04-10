@@ -924,7 +924,8 @@ Status FlushJob::WriteLevel0Table() {
                          << total_data_size << "memory_usage"
                          << total_memory_usage << "num_range_deletes"
                          << total_num_range_deletes << "flush_reason"
-                         << GetFlushReasonString(flush_reason_);
+                         << GetFlushReasonString(flush_reason_)
+                         << "millitime" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     total_flush_data_size = total_data_size;
 
     {
@@ -1076,9 +1077,9 @@ Status FlushJob::WriteLevel0Table() {
   //                cpu_micros);
   ROCKS_LOG_INFO(db_options_.info_log,
                  "[%s] [JOB %d] Flush: %" PRIu64
-                 " microseconds, %" PRIu64 " cpu microseconds, %" PRIu64 " bytes\n",
+                 " microseconds, %" PRIu64 " cpu microseconds, %" PRIu64 " bytes, millitime, %" PRIu64"\n",
                  cfd_->GetName().c_str(), job_context_->job_id, micros,
-                 cpu_micros, total_flush_data_size);
+                 cpu_micros, total_flush_data_size, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
   if (has_output) {
     stats.bytes_written = meta_.fd.GetFileSize();

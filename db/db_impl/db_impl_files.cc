@@ -332,6 +332,15 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
       }
       logs_to_free_.push_back(log.ReleaseWriter());
       logs_.pop_front();
+      std::ostringstream oss;
+      long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      oss << "remove_log,"
+          << timestamp << ","
+          << total_log_size_.load() << ","
+          << GetMaxTotalWalSize();
+      
+      // Log the formatted string
+      WAL_log(oss.str(), timestamp, "remove_log");
     }
     // Current log cannot be obsolete.
     assert(!logs_.empty());
