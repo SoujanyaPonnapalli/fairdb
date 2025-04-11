@@ -575,13 +575,21 @@ class MemTable {
     }
   }
 
+  void RemoveWALAttribution(uint64_t log_file_number) {
+    log_file_size_map_.erase(log_file_number);
+  }
+
   std::map<uint64_t, uint64_t> GetAttributionMap() {
     return log_file_size_map_;
   }
+
+  uint32_t GetColumnFamilyId() const { return column_family_id_; }
   
 
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
+
+  uint32_t column_family_id_;
 
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;

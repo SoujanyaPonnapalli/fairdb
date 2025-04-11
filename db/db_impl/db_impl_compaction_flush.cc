@@ -351,6 +351,14 @@ Status DBImpl::FlushMemTableToOutputFile(
   //   thread_metadata.client_id = std::stoi(cfd->GetName().substr(2));       
   // }
 
+
+  // Reattribute the WAL attributions of each memtable
+  if (s.ok()) {
+    for (auto& memtable : flush_job.GetMemTables()) {
+      ReattributeMemtable(memtable);
+    }
+  }
+
   if (s.ok()) {
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
                       &switched_to_mempurge, &skip_set_bg_error,

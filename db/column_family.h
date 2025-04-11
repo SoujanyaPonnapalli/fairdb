@@ -572,6 +572,10 @@ class ColumnFamilyData {
     cf_total_wal_attribution_ += attribution;
   }
 
+  void DeductWALAttribution(uint64_t attribution) {
+    cf_total_wal_attribution_ -= attribution;
+  }
+
  private:
   friend class ColumnFamilySet;
   ColumnFamilyData(uint32_t id, const std::string& name,
@@ -894,6 +898,10 @@ class ColumnFamilyMemTablesImpl : public ColumnFamilyMemTables {
   // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
   //           under a DB mutex OR from a write thread
   ColumnFamilyData* current() override { return current_; }
+
+  ColumnFamilyData* GetColumnFamilyData(uint32_t column_family_id) {
+    return column_family_set_->GetColumnFamily(column_family_id);
+  }
 
  private:
   ColumnFamilySet* column_family_set_;

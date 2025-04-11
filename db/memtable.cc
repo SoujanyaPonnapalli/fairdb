@@ -76,6 +76,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
                    WriteBufferManager* write_buffer_manager,
                    SequenceNumber latest_seq, uint32_t column_family_id)
     : comparator_(cmp),
+      column_family_id_(column_family_id),
       moptions_(ioptions, mutable_cf_options),
       refs_(0),
       kArenaBlockSize(Arena::OptimizeBlockSize(moptions_.arena_block_size)),
