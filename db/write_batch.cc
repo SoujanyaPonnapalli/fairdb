@@ -3124,11 +3124,12 @@ Status WriteBatchInternal::InsertInto(
 
     auto& writer_map = w->GetMemtableWriteCountMap();
     for (const auto& entry : inserter.GetCountMap()) {
-      auto it = writer_map.find(entry.first);
+      std::pair<MemTable*, ColumnFamilyData*> key = entry.first;
+      auto it = writer_map.find(key);
       if (it != writer_map.end()) {
         it->second += entry.second;
       } else {
-        writer_map[entry.first] = entry.second.load();
+        writer_map[key] = entry.second.load();
       }
     }
 
@@ -3163,13 +3164,15 @@ Status WriteBatchInternal::InsertInto(
 
   auto& writer_map = writer->GetMemtableWriteCountMap();
   for (const auto& entry : inserter.GetCountMap()) {
-    auto it = writer_map.find(entry.first);
+    std::pair<MemTable*, ColumnFamilyData*> key = entry.first;
+    auto it = writer_map.find(key);
     if (it != writer_map.end()) {
       it->second += entry.second;
     } else {
-      writer_map[entry.first] = entry.second.load();
+      writer_map[key] = entry.second.load();
     }
   }
+  return s;
 }
 
 Status WriteBatchInternal::InsertInto(

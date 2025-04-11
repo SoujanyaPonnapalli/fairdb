@@ -3012,8 +3012,8 @@ class DBImpl : public DB {
     long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   
     // Map: cf_id → total WAL bytes
-    std::map<uint32_t, uint64_t> cf_wal_totals;  // sorted by cf_id
-  
+    std::unordered_map<uint32_t, uint64_t> cf_wal_totals;
+
     for (const auto& log_file : alive_log_files_) {
       for (const auto& entry : log_file.memtable_size_map) {
         MemTable* mem = entry.first;
@@ -3022,14 +3022,15 @@ class DBImpl : public DB {
         cf_wal_totals[cfid] += size;
       }
     }
-  
+
+    // Format the output string
     std::ostringstream oss;
-    oss << "ATTRIBUTIONS, " << timestamp;
-  
+    oss << "attribution, " << timestamp;
+
     for (const auto& [cfid, total_bytes] : cf_wal_totals) {
-      oss << ", " << total_bytes;
+      oss << ", " << cfid << ":" << total_bytes;
     }
-  
+
     return oss.str();
   }
   
