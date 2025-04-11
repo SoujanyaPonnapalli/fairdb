@@ -3163,6 +3163,9 @@ Status WriteBatchInternal::InsertInto(
   Status s = writer->batch->Iterate(&inserter);
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
+  if (concurrent_memtable_writes) {
+    inserter.PostProcess();
+  }
 
   auto& writer_map = writer->GetMemtableWriteCountMap();
   for (const auto& entry : inserter.GetCountMap()) {
