@@ -2308,11 +2308,13 @@ class MemTableInserter : public WriteBatch::Handler {
     }
     // Find the column family for the memtable and increment the write count
     // for the memtable in the write count map
-    auto cf_handle = cf_mems_->current();
-    if (cf_handle != nullptr) {
-      auto mem = cf_mems_->GetMemTable();
-      auto& write_count = write_count_map_[{mem, cf_handle}];
-      write_count++;
+    if (ret_status.ok() && has_valid_writes_) {
+      auto cf_handle = cf_mems_->current();
+      if (cf_handle != nullptr) {
+        auto mem = cf_mems_->GetMemTable();
+        auto& write_count = write_count_map_[{mem, cf_handle}];
+        write_count++;
+      }
     }
   
     return ret_status;
