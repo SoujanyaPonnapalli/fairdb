@@ -712,30 +712,30 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           assert(tmp_s.ok());
         }
       }
-      std::map<std::pair<MemTable*, ColumnFamilyData*>, uint64_t> memtable_write_counts;
-      uint64_t total_writes = 0;
+      // std::map<std::pair<MemTable*, ColumnFamilyData*>, uint64_t> memtable_write_counts;
+      // uint64_t total_writes = 0;
       
-      for (auto* writer : write_group) {
-        for (const auto& [key, count] : writer->GetMemtableWriteCountMap()) {
-          memtable_write_counts[key] += count;
-          total_writes += count;
-        }
-      }
+      // for (auto* writer : write_group) {
+      //   for (const auto& [key, count] : writer->GetMemtableWriteCountMap()) {
+      //     memtable_write_counts[key] += count;
+      //     total_writes += count;
+      //   }
+      // }
       
-      // Get total WAL write size
-      uint64_t log_number = wal_write_data.log_number;
-      uint64_t log_size = wal_write_data.write_size;
+      // // Get total WAL write size
+      // uint64_t log_number = wal_write_data.log_number;
+      // uint64_t log_size = wal_write_data.write_size;
       
-      // Perform proportional attribution
-      for (const auto& [key, count] : memtable_write_counts) {
-        MemTable* memtable = key.first;
-        ColumnFamilyData* cfd = key.second;
+      // // Perform proportional attribution
+      // for (const auto& [key, count] : memtable_write_counts) {
+      //   MemTable* memtable = key.first;
+      //   ColumnFamilyData* cfd = key.second;
       
-        double proportion = static_cast<double>(count) / total_writes;
-        uint64_t attributed_bytes = static_cast<uint64_t>(proportion * log_size);
+      //   double proportion = static_cast<double>(count) / total_writes;
+      //   uint64_t attributed_bytes = static_cast<uint64_t>(proportion * log_size);
       
-        AddWALAttribution(log_number, attributed_bytes, memtable, cfd);
-      }
+      //   AddWALAttribution(log_number, attributed_bytes, memtable, cfd);
+      // }
       // Note: if we are to resume after non-OK statuses we need to revisit how
       // we reacts to non-OK statuses here.
       versions_->SetLastSequence(last_sequence);
@@ -1474,8 +1474,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << "," <<
-      immutable_db_options().atomic_flush << ",";
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
@@ -1594,8 +1593,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << "," <<
-      immutable_db_options().atomic_flush << ",";
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
@@ -1669,8 +1667,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   oss << "write,"
       << timestamp << ","
       << total_log_size_.load() << ","
-      << GetMaxTotalWalSize() << "," <<
-      immutable_db_options().atomic_flush << ",";
+      << GetMaxTotalWalSize() << ",";
   
   // Log the formatted string
   WAL_log(oss.str(), timestamp, "write");
