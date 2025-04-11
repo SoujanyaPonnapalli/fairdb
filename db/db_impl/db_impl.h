@@ -3006,6 +3006,34 @@ class DBImpl : public DB {
     }
   }
 
+  std::string GetCFWALAttributionString() {
+    InstrumentedMutexLock lock(&attribution_mutex_);
+  
+    long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  
+    // Map: cf_id → total WAL bytes
+    std::map<uint32_t, uint64_t> cf_wal_totals;  // sorted by cf_id
+  
+    for (const auto& log_file : alive_log_files_) {
+      for (const auto& entry : log_file.memtable_size_map) {
+        MemTable* mem = entry.first;
+        uint64_t size = entry.second;
+        uint32_t cfid = mem->GetColumnFamilyId();
+        cf_wal_totals[cfid] += size;
+      }
+    }
+  
+    std::ostringstream oss;
+    oss << "ATTRIBUTIONS, " << timestamp;
+  
+    for (const auto& [cfid, total_bytes] : cf_wal_totals) {
+      oss << ", " << total_bytes;
+    }
+  
+    return oss.str();
+  }
+  
+
 
   std::ofstream WALlogFile;
   std::mutex logMutex;
@@ -3029,6 +3057,7 @@ class DBImpl : public DB {
     if (timestamp > lastLoggedTimestamp || operation != "write") {
       lastLoggedTimestamp = timestamp;
       WALlogFile << msg << std::endl;
+      WALlogFile << GetCFWALAttributionString() << std::endl;
     }
   }
 
