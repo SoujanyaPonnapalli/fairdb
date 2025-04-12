@@ -2308,13 +2308,11 @@ class MemTableInserter : public WriteBatch::Handler {
     }
     // Find the column family for the memtable and increment the write count
     // for the memtable in the write count map
-    if (ret_status.ok() && has_valid_writes_) {
-      auto cf_handle = cf_mems_->current();
-      if (cf_handle != nullptr) {
-        auto mem = cf_mems_->GetMemTable();
-        auto& write_count = write_count_map_[{mem, cf_handle}];
-        write_count++;
-      }
+    auto cf_handle = cf_mems_->current();
+    if (cf_handle != nullptr) {
+      auto mem = cf_mems_->GetMemTable();
+      auto& write_count = write_count_map_[{mem, cf_handle}];
+      write_count++;
     }
   
     return ret_status;
@@ -3163,10 +3161,6 @@ Status WriteBatchInternal::InsertInto(
   Status s = writer->batch->Iterate(&inserter);
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
-  if (concurrent_memtable_writes) {
-    inserter.PostProcess();
-  }
-
   auto& writer_map = writer->GetMemtableWriteCountMap();
   for (const auto& entry : inserter.GetCountMap()) {
     std::pair<MemTable*, ColumnFamilyData*> key = entry.first;
@@ -3176,6 +3170,10 @@ Status WriteBatchInternal::InsertInto(
     } else {
       writer_map[key] = entry.second.load();
     }
+  }
+
+  if (concurrent_memtable_writes) {
+    inserter.PostProcess();
   }
   return s;
 }

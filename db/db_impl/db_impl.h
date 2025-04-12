@@ -3009,11 +3009,12 @@ class DBImpl : public DB {
   std::string GetCFWALAttributionString() {
     InstrumentedMutexLock lock(&attribution_mutex_);
   
-    long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
   
     // Map: cf_id → total WAL bytes
     std::unordered_map<uint32_t, uint64_t> cf_wal_totals;
-
+  
     for (const auto& log_file : alive_log_files_) {
       for (const auto& entry : log_file.memtable_size_map) {
         MemTable* mem = entry.first;
@@ -3022,17 +3023,25 @@ class DBImpl : public DB {
         cf_wal_totals[cfid] += size;
       }
     }
-
-    // Format the output string
-    std::ostringstream oss;
-    oss << "attribution, " << timestamp;
-
+  
+    // Format the inner list (cfid:total_bytes) as a single CSV element
+    std::ostringstream cf_list;
+    bool first = true;
     for (const auto& [cfid, total_bytes] : cf_wal_totals) {
-      oss << ", " << cfid << ":" << total_bytes;
+      if (!first) {
+        cf_list << " ";
+      }
+      cf_list << cfid << ":" << total_bytes;
+      first = false;
     }
-
+  
+    // Output the final CSV string
+    std::ostringstream oss;
+    oss << "attribution, " << timestamp << ", \"" << cf_list.str() << "\"";
+  
     return oss.str();
   }
+  
   
 
 
