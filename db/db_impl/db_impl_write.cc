@@ -721,10 +721,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           total_writes += count;
         }
       }
-      
-      // Get total WAL write size
+
       uint64_t log_number = wal_write_data.log_number;
       uint64_t log_size = wal_write_data.write_size;
+      
+      // Get total WAL write size
       
       // Perform proportional attribution
       for (const auto& [key, count] : memtable_write_counts) {
@@ -733,8 +734,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       
         double proportion = static_cast<double>(count) / total_writes;
         uint64_t attributed_bytes = static_cast<uint64_t>(proportion * log_size);
-      
-        AddWALAttribution(log_number, attributed_bytes, memtable, cfd);
+
+        memtable->AddWALAttribution(log_number);
       }
       // Note: if we are to resume after non-OK statuses we need to revisit how
       // we reacts to non-OK statuses here.
@@ -1441,6 +1442,13 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (!s.ok()) {
     return status_to_io_status(std::move(s));
   }
+  std::map<uint32_t, uint64_t> cf_size_map;
+  WalSizeCalculatingHandler handler(cf_size_map);
+  merged_batch.Iterate(&handler);
+  for (const auto& [cf, size] : cf_size_map) {
+    AddWALAttribution(logfile_number_, size, cf);
+  }
+
   *log_size = log_entry.size();
   // When two_write_queues_ WriteToWAL has to be protected from concurretn calls
   // from the two queues anyway and log_write_mutex_ is already held. Otherwise

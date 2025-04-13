@@ -405,4 +405,120 @@ class TimestampUpdater : public WriteBatch::Handler {
   size_t idx_ = 0;
 };
 
+// Handler to calculate WAL size per column family
+class WalSizeCalculatingHandler : public WriteBatch::Handler {
+ public:
+  explicit WalSizeCalculatingHandler(std::map<uint32_t, size_t>& wal_sizes)
+      : wal_sizes_(wal_sizes) {
+    wal_sizes_.clear();
+  }
+
+  size_t VarintLength(uint64_t v) {
+    int len = 1;
+    while (v >= 128) {
+      v >>= 7;
+      len++;
+    }
+    return len;
+  }
+  Status PutCF(uint32_t column_family_id, const Slice& key,
+               const Slice& value) override {
+    wal_sizes_[column_family_id] += RecordSize(column_family_id, key, value);
+    return Status::OK();
+  }
+
+  // PutEntityCF stores the entity as the value part
+  Status PutEntityCF(uint32_t column_family_id, const Slice& key,
+                     const Slice& entity) override {
+     wal_sizes_[column_family_id] += RecordSize(column_family_id, key, entity);
+     return Status::OK();
+  }
+
+
+  Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
+    wal_sizes_[column_family_id] += RecordSize(column_family_id, key);
+    return Status::OK();
+  }
+
+  Status SingleDeleteCF(uint32_t column_family_id, const Slice& key) override {
+    // SingleDelete uses the same record type and format as Delete in WriteBatch
+    wal_sizes_[column_family_id] += RecordSize(column_family_id, key);
+    return Status::OK();
+  }
+
+  Status DeleteRangeCF(uint32_t column_family_id, const Slice& begin_key,
+                       const Slice& end_key) override {
+    size_t record_size = 0;
+    record_size += 1; // Type byte
+    record_size += VarintLength(column_family_id);
+    record_size += VarintLength(begin_key.size());
+    record_size += begin_key.size();
+    record_size += VarintLength(end_key.size());
+    record_size += end_key.size();
+    wal_sizes_[column_family_id] += record_size;
+    return Status::OK();
+  }
+
+  Status MergeCF(uint32_t column_family_id, const Slice& key,
+                 const Slice& value) override {
+    wal_sizes_[column_family_id] += RecordSize(column_family_id, key, value);
+    return Status::OK();
+  }
+
+  Status PutBlobIndexCF(uint32_t column_family_id, const Slice& key,
+                        const Slice& value) override {
+    // PutBlobIndex uses the same record type and format as Put in WriteBatch
+    wal_sizes_[column_family_id] += RecordSize(column_family_id, key, value);
+    return Status::OK();
+  }
+
+  // TimedPutCF is not directly represented in the standard WAL format in a way
+  // that changes size calculation compared to PutCF based on the provided write_time.
+  // The timestamp is typically embedded within the key or managed separately.
+  // We'll treat its WAL size contribution like a standard Put.
+  Status TimedPutCF(uint32_t column_family_id, const Slice& key,
+                  const Slice& value, uint64_t /*write_unix_time*/) override {
+      wal_sizes_[column_family_id] += RecordSize(column_family_id, key, value);
+      return Status::OK();
+  }
+
+
+  // Ignore operations without a specific column family ID for WAL size calculation
+  // as per the request.
+  void LogData(const Slice& /*blob*/) override {}
+  Status MarkBeginPrepare(bool /*unprepared_batch*/) override { return Status::OK(); }
+  Status MarkEndPrepare(const Slice& /*xid*/) override { return Status::OK(); }
+  Status MarkNoop(bool /*empty_batch*/) override { return Status::OK(); }
+  Status MarkRollback(const Slice& /*xid*/) override { return Status::OK(); }
+  Status MarkCommit(const Slice& /*xid*/) override { return Status::OK(); }
+  Status MarkCommitWithTimestamp(const Slice& /*xid*/, const Slice& /*commit_ts*/) override { return Status::OK(); }
+
+
+ private:
+  std::map<uint32_t, size_t>& wal_sizes_;
+
+  // Calculate size for key-only records (Delete, SingleDelete)
+  size_t RecordSize(uint32_t cf, const Slice& key) {
+    size_t record_size = 0;
+    record_size += 1; // Type byte
+    record_size += VarintLength(cf);
+    record_size += VarintLength(key.size());
+    record_size += key.size();
+    return record_size;
+  }
+
+  // Calculate size for key-value records (Put, Merge, PutBlobIndex, PutEntity)
+  size_t RecordSize(uint32_t cf, const Slice& key, const Slice& value) {
+      size_t record_size = 0;
+      record_size += 1; // Type byte
+      record_size += VarintLength(cf);
+      record_size += VarintLength(key.size());
+      record_size += key.size();
+      record_size += VarintLength(value.size());
+      record_size += value.size();
+      return record_size;
+  }
+};
+
+
 }  // namespace ROCKSDB_NAMESPACE

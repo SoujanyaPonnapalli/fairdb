@@ -1668,7 +1668,7 @@ class DBImpl : public DB {
     uint64_t size = 0;
     bool getting_flushed = false;
     // map from memtable to size attributable to that memtable
-    std::map<MemTable*, uint64_t> memtable_size_map;
+    std::map<uint32_t, uint64_t> cf_size_map;
   };
 
   struct LogWriterNumber {
@@ -2849,82 +2849,27 @@ class DBImpl : public DB {
   // Total WAL attribution for the database
   u_int64_t total_wal_attribution = 0;
 
-  // Adds WAL attribution for the given memtable and log 
+  // Adds WAL attribution for the given memtable and log
   // file to the memtable, column family, database, and WAL
   void AddWALAttribution(
     const uint64_t log_number, const uint64_t log_size,
-    MemTable* memtable, ColumnFamilyData* cfd) {
-      // Lock attribution mutex
-      InstrumentedMutexLock lock(&attribution_mutex_);
-      total_wal_attribution += log_size;
-      memtable->AddWALAttribution(log_number, log_size);
-      cfd->AddWALAttribution(log_size);
-
-      // Get wal number size struct corresponding to log_number in alive_log_files_
-      auto it = std::find_if(alive_log_files_.begin(), alive_log_files_.end(),
-                             [log_number](const LogFileNumberSize& log_file) {
-                               return log_file.number == log_number;
-                             });
-
-      // Error handling if log number not found
-      if (it == alive_log_files_.end()) {
-        std::cerr << "Log number not found in alive_log_files_" << std::endl;
+    const uint32_t column_family_id) {
+      // Find the column family data
+      ColumnFamilyData* cfd = column_family_memtables_->GetColumnFamilyData(column_family_id);
+      if (!cfd) {
+        // Handle error: Column family not found
+        std::cerr << "Error: Column family data not found for ID " << column_family_id << std::endl;
         return;
       }
 
-      // Update the map inside the LogFileNumberSize struct with the memtable* to size mapping. 
-      // If the memtable* is not found, it will be added with the log size.
-      auto& log_file = *it;
-      auto memtable_it = log_file.memtable_size_map.find(memtable);
-      if (memtable_it != log_file.memtable_size_map.end()) {
-        memtable_it->second += log_size;
-      } else {
-        log_file.memtable_size_map[memtable] = log_size;
-      }
-    }
+      // Lock the attribution mutex
+      InstrumentedMutexLock lock(&attribution_mutex_);
 
-  void AddWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
-    MemTable* memtable, ColumnFamilyData* cfd) {
-      memtable->AddWALAttribution(log_ptr->number, log_size);
+      // Add attribution to the column family
       cfd->AddWALAttribution(log_size);
 
-      // Update the map inside the LogFileNumberSize struct with the memtable* to size mapping. 
-      auto memtable_it = log_ptr->memtable_size_map.find(memtable);
-      if (memtable_it != log_ptr->memtable_size_map.end()) {
-        memtable_it->second += log_size;
-      } else {
-        log_ptr->memtable_size_map[memtable] = log_size;
-      }
-    }
-
-  void DeductWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
-    MemTable* memtable, ColumnFamilyData* cfd) {
-      memtable->RemoveWALAttribution(log_ptr->number);
-      cfd->DeductWALAttribution(log_size);
-
-      // Update the map inside the LogFileNumberSize struct with the memtable* to size mapping. 
-      auto memtable_it = log_ptr->memtable_size_map.find(memtable);
-      if (memtable_it != log_ptr->memtable_size_map.end()) {  
-        if (memtable_it->second > log_size) {
-          memtable_it->second -= log_size;
-        } else {
-          log_ptr->memtable_size_map.erase(memtable_it);
-        }
-      }
-    }
-
-  void ReattributeMemtable(MemTable* memtable) {
-    // Lock attribution mutex
-    InstrumentedMutexLock lock(&attribution_mutex_);
-    // Get the column family data for the memtable
-    u_int32_t cfid = memtable->GetColumnFamilyId();
-    ColumnFamilyData* cfd = column_family_memtables_->GetColumnFamilyData(cfid);
-
-    // Iterate through attribution map 
-    for (auto& mapvalue: memtable->GetAttributionMap()) {
-      // Get the log number and size
-      uint64_t log_number = mapvalue.first;
-      uint64_t log_size = mapvalue.second;
+      // Add attribution to the total WAL size
+      total_wal_attribution += log_size;
 
       // Find the log file number size struct in alive_log_files_
       auto it = std::find_if(alive_log_files_.begin(), alive_log_files_.end(),
@@ -2934,76 +2879,164 @@ class DBImpl : public DB {
 
       // Error handling if log number not found
       if (it == alive_log_files_.end()) {
-        std::cerr << "Log number not found in alive_log_files_" << std::endl;
+        std::cerr << "Log number " << log_number << " not found in alive_log_files_ during AddWALAttribution" << std::endl;
+        // We might still proceed if the log was just pruned, but the CF and total attribution were updated.
+        // However, log attribution cannot be updated. Log this inconsistency.
+        return;
+      }
+
+      // Update the map inside the LogFileNumberSize struct
+      auto& log_file = *it;
+      auto cf_it = log_file.cf_size_map.find(column_family_id);
+      if (cf_it != log_file.cf_size_map.end()) {
+        cf_it->second += log_size;
+      } else {
+        log_file.cf_size_map[column_family_id] = log_size;
+      }
+    }
+
+  void AddWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
+    const uint32_t cfid, ColumnFamilyData* cfd) {
+      // Add attribution to the column family
+      cfd->AddWALAttribution(log_size);
+
+      // Add attribution to the total WAL size
+      total_wal_attribution += log_size;
+
+      // Update the map inside the LogFileNumberSize struct
+      log_ptr->cf_size_map[cfid] += log_size;
+    }
+
+  void DeductWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
+    const uint32_t cfid, ColumnFamilyData* cfd) {
+      // Deduct attribution from the column family
+      cfd->DeductWALAttribution(log_size);
+
+      // Deduct attribution from the total WAL size
+      total_wal_attribution -= log_size;
+
+      // Update the map inside the LogFileNumberSize struct
+      auto cf_it = log_ptr->cf_size_map.find(cfid);
+      if (cf_it != log_ptr->cf_size_map.end()) {
+        log_ptr->cf_size_map.erase(cf_it);
+      } else {
+          // This indicates an inconsistency, log it.
+           std::cerr << "Error: CFID " << cfid << " not found in log " << log_ptr->number << " cf_size_map during DeductWALAttribution" << std::endl;
+      }
+    }
+
+  void ReattributeMemtable(MemTable* memtable) {
+    // Lock attribution mutex
+    InstrumentedMutexLock lock(&attribution_mutex_);
+    // Get the column family data for the memtable
+    uint32_t cfid = memtable->GetColumnFamilyId();
+    ColumnFamilyData* cfd = column_family_memtables_->GetColumnFamilyData(cfid);
+     if (!cfd) {
+        // Handle error: Column family not found
+        std::cerr << "Error: Column family data not found for ID " << cfid << " in ReattributeMemtable" << std::endl;
+        return;
+      }
+
+    // Iterate through the log numbers this memtable was attributed to
+    std::set<uint64_t> log_numbers = memtable->GetAttributionSet();
+    for (uint64_t log_number : log_numbers) {
+      // Find the log file number size struct in alive_log_files_
+      auto it = std::find_if(alive_log_files_.begin(), alive_log_files_.end(),
+                             [log_number](const LogFileNumberSize& log_file) {
+                               return log_file.number == log_number;
+                             });
+
+      // If log number not found, it might have been purged already.
+      // The attribution should have been handled during purge or earlier reattribution.
+      if (it == alive_log_files_.end()) {
+         // This might happen if the log was purged just before this flush completed.
+         // Log this potential inconsistency for debugging if needed.
+         // std::cerr << "Log number " << log_number << " not found in alive_log_files_ during ReattributeMemtable for CF " << cfid << std::endl;
         continue;
       }
 
-      // Update the map inside the LogFileNumberSize struct with the memtable* to size mapping. 
       auto& log_file = *it;
 
-      DeductWALAttribution(&log_file, log_size, memtable, cfd);
-
-    // Find reattribution locations and reattribute
-    // Now, find unflushed memtables in the same log file
-      std::vector<MemTable*> same_file_unflushed;
-      for (auto& pair : log_file.memtable_size_map) {
-        MemTable* other_mem = pair.first;
-        if (other_mem != memtable) {
-          same_file_unflushed.push_back(other_mem);
-        }
+      // Get the size attributed to this memtable (CFID) in this log file
+      uint64_t log_size = 0;
+      auto cf_it = log_file.cf_size_map.find(cfid);
+      if (cf_it != log_file.cf_size_map.end()) {
+          log_size = cf_it->second;
+      } else {
+          // This indicates an inconsistency if log_size is expected to be non-zero
+          std::cerr << "Error: CFID " << cfid << " not found in log " << log_number << " cf_size_map during ReattributeMemtable, expected size > 0" << std::endl;
+          continue; // Skip reattribution for this log if size is missing/zero
       }
 
-      if (!same_file_unflushed.empty()) {
-        // Check for same column family memtables
-        std::vector<MemTable*> same_cf_mems;
-        for (MemTable* other_mem : same_file_unflushed) {
-          if (other_mem->GetColumnFamilyId() == cfid) {
-            same_cf_mems.push_back(other_mem);
-          }
-        }
+      // Deduct the attribution from the flushed memtable's CF, the log file map, and total.
+      // Note: The memtable object itself is being flushed, so no need to update it directly.
+      DeductWALAttribution(&log_file, log_size, cfid, cfd);
 
-        if (!same_cf_mems.empty()) {
-          // Evenly distribute among same CF memtables
-          uint64_t share = log_size / same_cf_mems.size();
-          for (MemTable* target_mem : same_cf_mems) {
-            ColumnFamilyData* target_cfd = column_family_memtables_->GetColumnFamilyData(target_mem->GetColumnFamilyId());
-            AddWALAttribution(&log_file, share, target_mem, target_cfd);
-          }
-        } else {
-          // Evenly distribute among all other memtables
-          uint64_t share = log_size / same_file_unflushed.size();
-          for (MemTable* target_mem : same_file_unflushed) {
-            ColumnFamilyData* target_cfd = column_family_memtables_->GetColumnFamilyData(target_mem->GetColumnFamilyId());
-            AddWALAttribution(&log_file, share, target_mem, target_cfd);
+      // Find reattribution targets
+      // Check if there are other unflushed memtables in the same log file
+      if (!log_file.cf_size_map.empty()) {
+        // Case 1: Reattribute within the same log file
+        size_t remaining_cf_count = log_file.cf_size_map.size();
+        uint64_t share = log_size / remaining_cf_count;
+        uint64_t remainder = log_size % remaining_cf_count; // Handle potential division remainder
+
+        for (auto& pair : log_file.cf_size_map) {
+          uint32_t target_cfid = pair.first;
+          ColumnFamilyData* target_cfd = column_family_memtables_->GetColumnFamilyData(target_cfid);
+          if (target_cfd) {
+              uint64_t current_share = share + (remainder > 0 ? 1 : 0);
+              AddWALAttribution(&log_file, current_share, target_cfid, target_cfd);
+              if (remainder > 0) {
+                  remainder--;
+              }
+          } else {
+              std::cerr << "Error: Target CFD " << target_cfid << " not found during same-log reattribution from CF " << cfid << std::endl;
           }
         }
       } else {
-        auto current_it = it;  // `it` is already pointing to the current log entry
+        // Case 2: No other memtables in the same log file, look for older logs
+        auto current_it = it;
         bool reattributed = false;
 
         while (current_it != alive_log_files_.begin()) {
-          --current_it;
-          if (!current_it->memtable_size_map.empty()) {
-            auto& older_log_file = *current_it;
-            size_t mem_count = older_log_file.memtable_size_map.size();
-            uint64_t share = log_size / mem_count;
-          
-            for (auto& pair : older_log_file.memtable_size_map) {
-              MemTable* target_mem = pair.first;
-              ColumnFamilyData* target_cfd =
-                  column_family_memtables_->GetColumnFamilyData(target_mem->GetColumnFamilyId());
-              AddWALAttribution(&older_log_file, share, target_mem, target_cfd);
+          --current_it; // Move to the previous log file entry
+          auto& older_log_file = *current_it;
+
+          if (!older_log_file.cf_size_map.empty()) {
+            // Found the most recent older log file with unflushed memtables
+            size_t target_cf_count = older_log_file.cf_size_map.size();
+            uint64_t share = log_size / target_cf_count;
+            uint64_t remainder = log_size % target_cf_count; // Handle potential division remainder
+
+            for (auto& pair : older_log_file.cf_size_map) {
+              uint32_t target_cfid = pair.first;
+               ColumnFamilyData* target_cfd = column_family_memtables_->GetColumnFamilyData(target_cfid);
+               if (target_cfd) {
+                   uint64_t current_share = share + (remainder > 0 ? 1 : 0);
+                   AddWALAttribution(&older_log_file, current_share, target_cfid, target_cfd);
+                   if (remainder > 0) {
+                       remainder--;
+                   }
+               } else {
+                  std::cerr << "Error: Target CFD " << target_cfid << " not found during older-log reattribution from CF " << cfid << std::endl;
+               }
             }
-          
             reattributed = true;
-            break;
+            break; // Stop searching older logs once reattributed
           }
         }
-        if (!reattributed) {
-          total_wal_attribution -= log_size;
-        }
+
+        // Case 2b: No older log file with memtables found.
+        // The deduction in DeductWALAttribution already handled the total_wal_attribution.
+        // No further action needed for this specific log_size.
+        // if (!reattributed) {
+        //   // This space is now completely unaccounted for by live memtables.
+        //   // The total_wal_attribution was already decremented by DeductWALAttribution.
+        // }
       }
     }
+     // After iterating through all logs, clear the memtable's attribution set as it's flushed
+     memtable->GetAttributionSet().clear();
   }
 
   std::string GetCFWALAttributionString() {
@@ -3016,10 +3049,9 @@ class DBImpl : public DB {
     std::unordered_map<uint32_t, uint64_t> cf_wal_totals;
   
     for (const auto& log_file : alive_log_files_) {
-      for (const auto& entry : log_file.memtable_size_map) {
-        MemTable* mem = entry.first;
+      for (const auto& entry : log_file.cf_size_map) {
+        uint32_t cfid = entry.first;
         uint64_t size = entry.second;
-        uint32_t cfid = mem->GetColumnFamilyId();
         cf_wal_totals[cfid] += size;
       }
     }
@@ -3048,12 +3080,17 @@ class DBImpl : public DB {
   std::ofstream WALlogFile;
   std::mutex logMutex;
   long long lastLoggedTimestamp = -1;
+  long long start_time = 0;
+  long long last_wal_log_time = 0;
 
   void init_WAL_logging() {
     WALlogFile.open("logs/WAL_logs.csv");
     if (!WALlogFile.is_open()) {
       std::cerr << "Failed to open WAL log file" << std::endl;
     }
+    start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    last_wal_log_time = start_time;
   }
 
   void WAL_log(const std::string& msg, long long timestamp, std::string operation) {
@@ -3068,7 +3105,19 @@ class DBImpl : public DB {
       lastLoggedTimestamp = timestamp;
       WALlogFile << msg << std::endl;
       WALlogFile << GetCFWALAttributionString() << std::endl;
+      if (timestamp - last_wal_log_time >= 5000) {
+        WALlogFile << LogAliveLogMemtableAttribution() << std::endl;
+        last_wal_log_time = timestamp;
+      }
     }
+  }
+
+  void WAL_log_unlimited(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (!WALlogFile.is_open()) {
+      init_WAL_logging();
+    }
+    WALlogFile << msg << std::endl;
   }
 
   void close_WAL_logging() {
@@ -3087,6 +3136,26 @@ class DBImpl : public DB {
     long counter = atomic_counter;
     increment_atomic_counter();
     return counter;
+  }
+
+  // Logs WAL attribution stats periodically.
+  std::string LogAliveLogMemtableAttribution() {
+    std::ostringstream result;
+    for (const auto& log_file : alive_log_files_) {
+      if (!log_file.cf_size_map.empty()) {
+        result << "Log " << log_file.number << " attribution: ";
+        bool first = true;
+        for (const auto& [cfid, size] : log_file.cf_size_map) {
+          if (!first) {
+            result << ", ";
+          }
+          result << "CF" << cfid << "=" << size;
+          first = false;
+        }
+        result << "\n";
+      }
+    }
+    return result.str();
   }
 };
 

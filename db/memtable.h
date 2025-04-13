@@ -566,21 +566,16 @@ class MemTable {
 
   // Adds size to the corresponding log file number in the log_file_size_map_.
   // If it does not exist, it will be created.
-  void AddWALAttribution(uint64_t log_file_number, uint64_t size) {
-    auto it = log_file_size_map_.find(log_file_number);
-    if (it == log_file_size_map_.end()) {
-      log_file_size_map_[log_file_number] = size;
-    } else {
-      it->second += size;
-    }
+  void AddWALAttribution(uint64_t log_file_number) {
+    log_file_set_.insert(log_file_number);
   }
 
   void RemoveWALAttribution(uint64_t log_file_number) {
-    log_file_size_map_.erase(log_file_number);
+    log_file_set_.erase(log_file_number);
   }
 
-  std::map<uint64_t, uint64_t> GetAttributionMap() {
-    return log_file_size_map_;
+  std::set<uint64_t> GetAttributionSet() {
+    return log_file_set_;
   }
 
   uint32_t GetColumnFamilyId() const { return column_family_id_; }
@@ -638,7 +633,7 @@ class MemTable {
   // Map from log file number to the size attribution of the memtable
   // to the log file. This is used to track the size of the memtable
 
-  std::map<uint64_t, uint64_t> log_file_size_map_;
+  std::set<uint64_t> log_file_set_;
 
   // the earliest log containing a prepared section
   // which has been inserted into this memtable.
