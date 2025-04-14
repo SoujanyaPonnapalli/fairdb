@@ -2862,16 +2862,19 @@ class DBImpl : public DB {
         return;
       }
 
-      // Lock the attribution mutex
+      // Lock the DBImpl attribution mutex
       InstrumentedMutexLock lock(&attribution_mutex_);
 
-      // Add attribution to the column family
+      // Add attribution to the column family object
       cfd->AddWALAttribution(log_size);
 
-      // Add attribution to the total WAL size
+      // Add attribution to the total WAL size (DBImpl tracking)
       total_wal_attribution += log_size;
 
       // Find the log file number size struct in alive_log_files_
+      // Note: alive_log_files_ access requires log_write_mutex_ in some paths,
+      // ensure this call path is safe or acquire log_write_mutex_ if needed.
+      // Assuming attribution_mutex_ is sufficient for this specific call path.
       auto it = std::find_if(alive_log_files_.begin(), alive_log_files_.end(),
                              [log_number](const LogFileNumberSize& log_file) {
                                return log_file.number == log_number;
@@ -2879,40 +2882,47 @@ class DBImpl : public DB {
 
       // Error handling if log number not found
       if (it == alive_log_files_.end()) {
+         // Consider using ROCKS_LOG_WARN/ERROR
         std::cerr << "Log number " << log_number << " not found in alive_log_files_ during AddWALAttribution" << std::endl;
-        // We might still proceed if the log was just pruned, but the CF and total attribution were updated.
-        // However, log attribution cannot be updated. Log this inconsistency.
-        return;
+        // Proceed with WBM attribution even if log file struct is gone
+      } else {
+          // Update the map inside the LogFileNumberSize struct
+          auto& log_file = *it;
+          log_file.cf_size_map[column_family_id] += log_size;
       }
 
-      // Update the map inside the LogFileNumberSize struct
-      auto& log_file = *it;
-      auto cf_it = log_file.cf_size_map.find(column_family_id);
-      if (cf_it != log_file.cf_size_map.end()) {
-        cf_it->second += log_size;
-      } else {
-        log_file.cf_size_map[column_family_id] = log_size;
-      }
+      // Attribute space in the WAL Manager (locks its own mutex)
+      write_buffer_manager_->AttributeWALSpace(column_family_id, log_size);
     }
 
+  // Overload likely called during recovery/flush where log_ptr is known
   void AddWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
     const uint32_t cfid, ColumnFamilyData* cfd) {
-      // Add attribution to the column family
+      // Lock the DBImpl attribution mutex
+      InstrumentedMutexLock lock(&attribution_mutex_);
+
+      // Add attribution to the column family object
       cfd->AddWALAttribution(log_size);
 
-      // Add attribution to the total WAL size
+      // Add attribution to the total WAL size (DBImpl tracking)
       total_wal_attribution += log_size;
 
       // Update the map inside the LogFileNumberSize struct
       log_ptr->cf_size_map[cfid] += log_size;
+
+      // Attribute space in the WAL Manager (locks its own mutex)
+      write_buffer_manager_->AttributeWALSpace(cfid, log_size);
     }
 
   void DeductWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
     const uint32_t cfid, ColumnFamilyData* cfd) {
-      // Deduct attribution from the column family
+      // Lock the DBImpl attribution mutex
+      InstrumentedMutexLock lock(&attribution_mutex_);
+
+      // Deduct attribution from the column family object
       cfd->DeductWALAttribution(log_size);
 
-      // Deduct attribution from the total WAL size
+      // Deduct attribution from the total WAL size (DBImpl tracking)
       total_wal_attribution -= log_size;
 
       // Update the map inside the LogFileNumberSize struct
@@ -2923,6 +2933,9 @@ class DBImpl : public DB {
           // This indicates an inconsistency, log it.
            std::cerr << "Error: CFID " << cfid << " not found in log " << log_ptr->number << " cf_size_map during DeductWALAttribution" << std::endl;
       }
+
+      // Deattribute space in the WAL Manager (locks its own mutex)
+      write_buffer_manager_->DeattributeWALSpace(cfid, log_size);
     }
 
   void ReattributeMemtable(MemTable* memtable) {
@@ -3094,19 +3107,19 @@ class DBImpl : public DB {
   }
 
   void WAL_log(const std::string& msg, long long timestamp, std::string operation) {
-    if (timestamp <= lastLoggedTimestamp && operation == "write") {
+    if (timestamp <= lastLoggedTimestamp + 3 && operation == "write") {
       return;
     }
     std::lock_guard<std::mutex> lock(logMutex);
     if (!WALlogFile.is_open()) {
       init_WAL_logging();
     }
-    if (timestamp > lastLoggedTimestamp || operation != "write") {
+    if (timestamp > lastLoggedTimestamp + 3 || operation != "write") {
       lastLoggedTimestamp = timestamp;
       WALlogFile << msg << std::endl;
       WALlogFile << GetCFWALAttributionString() << std::endl;
       if (timestamp - last_wal_log_time >= 5000) {
-        WALlogFile << LogAliveLogMemtableAttribution() << std::endl;
+        WALlogFile << write_buffer_manager_->LogWALManagerUsage() << std::endl;
         last_wal_log_time = timestamp;
       }
     }
@@ -3157,6 +3170,18 @@ class DBImpl : public DB {
     }
     return result.str();
   }
+
+  // Maybe schedule flush if WAL limits necessitate it for the given CF and size.
+  // Returns Status::OK if write is okay, Status::MemoryLimit if flush was
+  // scheduled (caller should typically retry), or other error status.
+  // REQUIRES: DB mutex held.
+  Status MaybeScheduleFlushForWAL(uint32_t cf_id, size_t write_size);
+
+  // Check WAL manager limits after a flush. If global pool usage exceeds
+  // limits, schedule flushes for column families contributing to the oldest
+  // WAL files to free up space.
+  // REQUIRES: DB mutex held.
+  void MaybeScheduleFlushForWALConsistency();
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

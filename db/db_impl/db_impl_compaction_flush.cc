@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cinttypes>
 #include <deque>
+#include <set> // Include for std::set
 
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
@@ -358,6 +359,8 @@ Status DBImpl::FlushMemTableToOutputFile(
       ReattributeMemtable(memtable);
     }
   }
+
+  MaybeScheduleFlushForWALConsistency();
 
   if (s.ok()) {
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
@@ -4400,6 +4403,96 @@ Status DBImpl::WaitForCompact(
     } else {
       return error_handler_.GetBGError();
     }
+  }
+}
+
+// Called after a memtable flush has completed. Checks if the WAL manager
+// requires additional flushes due to global pool limits exceeding reservations.
+// If so, schedules flushes for CFs active in the oldest WAL files.
+void DBImpl::MaybeScheduleFlushForWALConsistency() {
+  mutex_.AssertHeld();
+
+  // Check the WAL manager for overshoot.
+  size_t overshoot_bytes = write_buffer_manager_->CheckEnsureReservedSpaceAvailable();
+
+  if (overshoot_bytes == 0) {
+    // Global pool usage is within limits, nothing to do.
+    return;
+  }
+
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "WALManager global pool overshoot detected: %" ROCKSDB_PRIszt " bytes. Checking oldest WALs for flush candidates.",
+                 overshoot_bytes);
+
+  size_t bytes_to_be_freed = 0;
+  std::set<ColumnFamilyData*> cfds_to_flush_set;
+  autovector<ColumnFamilyData*> cfds_to_flush_vec; // Use autovector directly
+
+  // Iterate through alive logs from oldest to newest.
+  // Need log_write_mutex to safely access alive_log_files_ if accessed concurrently.
+  // However, this path is likely under DB mutex only in current code, make sure
+  // any callers uphold this or acquire log_write_mutex_. Assuming DB mutex is sufficient here.
+  for (const auto& log_file : alive_log_files_) {
+    if (log_file.cf_size_map.empty()) {
+      continue; // Skip logs with no attributed CFs
+    }
+
+    // Check CFs attributed to this log file.
+    for (const auto& pair : log_file.cf_size_map) {
+      uint32_t cfid = pair.first;
+      size_t attributed_size = pair.second;
+
+      ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(cfid);
+
+      // Check conditions for flushing this CF:
+      // 1. CF exists and is not dropped.
+      // 2. CF is not already marked for this batch of flushes.
+      // 3. CF has a non-empty active memtable (flushing an empty one won't help now).
+      // 4. CF is not already queued for *any* flush (avoid redundant scheduling).
+      if (cfd != nullptr && !cfd->IsDropped() &&
+          cfds_to_flush_set.find(cfd) == cfds_to_flush_set.end() &&
+          !cfd->mem()->IsEmpty() && !cfd->queued_for_flush()) {
+
+            // Add to our set and vector
+            cfds_to_flush_set.insert(cfd);
+            cfds_to_flush_vec.push_back(cfd);
+
+            // Add the attributed size in this log file to the potential freed amount.
+            // This is an approximation, but targets the right logs.
+            bytes_to_be_freed += attributed_size;
+
+            ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
+                           "[%s] Selected for WAL consistency flush (from log %" PRIu64 ", size %" ROCKSDB_PRIszt "). Total needed: %" ROCKSDB_PRIszt ", potential freed: %" ROCKSDB_PRIszt,
+                           cfd->GetName().c_str(), log_file.number, attributed_size,
+                           overshoot_bytes, bytes_to_be_freed);
+
+            // Check if we've potentially freed enough space
+            if (bytes_to_be_freed >= overshoot_bytes) {
+                 goto schedule_flushes; // Exit loops early
+            }
+      }
+    }
+    // If we've checked all CFs in this log and haven't freed enough, continue to next log.
+  }
+
+schedule_flushes:
+  if (!cfds_to_flush_vec.empty()) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "Scheduling %" ROCKSDB_PRIszt " CFs for flush to free WAL global pool space (target: %" ROCKSDB_PRIszt " bytes, potential: %" ROCKSDB_PRIszt " bytes)",
+                   cfds_to_flush_vec.size(), overshoot_bytes, bytes_to_be_freed);
+
+    FlushRequest req;
+    // Use kWriteBufferManager reason as this flush is driven by WBM limits.
+    GenerateFlushRequest(cfds_to_flush_vec, FlushReason::kWriteBufferManager, &req);
+    SchedulePendingFlush(req);
+    MaybeScheduleFlushOrCompaction(); // Wake up background thread if needed
+  } else if (overshoot_bytes > 0) {
+      // We needed to free space but couldn't find any suitable CFs in the oldest logs
+      // with non-empty memtables. This might indicate WAL bloat from CFs that were
+      // dropped or flushed but whose logs haven't been purged yet.
+       ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "WALManager requires %" ROCKSDB_PRIszt " bytes freed, but no suitable CFs found in oldest WALs to flush.",
+                   overshoot_bytes);
   }
 }
 
