@@ -29,6 +29,7 @@
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
 #include "util/thread_local.h"
+#include <queue>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -576,6 +577,75 @@ class ColumnFamilyData {
     cf_total_wal_attribution_ -= attribution;
   }
 
+  void SetLastFlushStartTime(long long time) {
+    last_flush_start_time_ = time;
+  }
+
+  long long GetLastFlushStartTime() const {
+    return last_flush_start_time_;
+  }
+
+  long long AddFlushQueueTime(long long time) {
+    flush_queue_time_.push(time);
+    return time;
+  }
+
+  long long GetFlushQueueTime() {
+    if (flush_queue_time_.empty()) {
+      return 0;
+    }
+    long long time = flush_queue_time_.front();
+    flush_queue_time_.pop();
+    return time;
+  }
+
+  long long AddCompactionQueueTime(long long time) {
+    compaction_queue_time_.push(time);
+    return time;
+  }
+
+  long long GetCompactionQueueTime() {
+    if (compaction_queue_time_.empty()) {
+      return 0;
+    }
+    long long time = compaction_queue_time_.front();
+    compaction_queue_time_.pop();
+    return time;
+  }
+
+  long long GetLastCompactionStartTime() const {
+    return last_compaction_start_time_;
+  }
+
+  void SetLastCompactionStartTime(long long time) {
+    last_compaction_start_time_ = time;
+  }
+
+  void IncrementCurrentThreadUsage(uint32_t usage) {
+    current_thread_usage += usage;
+  }
+  void DecrementCurrentThreadUsage(uint32_t usage) {
+    current_thread_usage -= usage;
+  }
+  uint32_t GetCurrentThreadUsage() const { return current_thread_usage; }
+
+  void SetLastServiceTime(uint64_t time) {
+    dfs_last_service_time = time;
+  }
+  uint64_t GetLastServiceTime() const {
+    return dfs_last_service_time;
+  }
+
+  const uint32_t dfs_delta_ms;
+  const double dfs_weight;
+  const double dfs_rho_ms;
+  const double dfs_fair_share;
+  const bool is_steady;
+  double dfs_credit_ms;
+  uint32_t current_thread_usage;
+  uint64_t dfs_last_service_time;
+  uint64_t dfs_last_tick;
+
  private:
   friend class ColumnFamilySet;
   ColumnFamilyData(uint32_t id, const std::string& name,
@@ -680,6 +750,15 @@ class ColumnFamilyData {
 
   // Size in WAL attributed to this CF
   uint64_t cf_total_wal_attribution_;
+
+  long long last_flush_start_time_;
+
+  long long last_compaction_start_time_;
+
+  std::queue<long long> flush_queue_time_;
+
+  std::queue<long long> compaction_queue_time_;
+
 };
 
 // ColumnFamilySet has interesting thread-safety requirements

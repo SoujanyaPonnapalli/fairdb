@@ -173,7 +173,12 @@ struct MutableCFOptions {
         compression_per_level(options.compression_per_level),
         memtable_max_range_deletions(options.memtable_max_range_deletions),
         bottommost_file_compaction_delay(
-            options.bottommost_file_compaction_delay) {
+            options.bottommost_file_compaction_delay),
+            dfs_delta_ms(options.dfs_delta_ms),
+            dfs_weight(options.dfs_weight),
+            dfs_rho_ms(options.dfs_rho_ms),
+            dfs_fair_share_ms(options.dfs_fair_share_ms),
+            is_steady(options.is_steady) {
     RefreshDerivedOptions(options.num_levels, options.compaction_style);
   }
 
@@ -223,7 +228,12 @@ struct MutableCFOptions {
         memtable_protection_bytes_per_key(0),
         block_protection_bytes_per_key(0),
         sample_for_compression(0),
-        memtable_max_range_deletions(0) {}
+        memtable_max_range_deletions(0),
+        dfs_delta_ms(std::numeric_limits<uint32_t>::max()),
+        dfs_weight(1.0),
+        dfs_rho_ms(0.0),
+        dfs_fair_share_ms(0.0),
+        is_steady(false) {}
 
   explicit MutableCFOptions(const Options& options);
 
@@ -319,6 +329,11 @@ struct MutableCFOptions {
   std::vector<CompressionType> compression_per_level;
   uint32_t memtable_max_range_deletions;
   uint32_t bottommost_file_compaction_delay;
+  uint32_t dfs_delta_ms;
+  double dfs_weight;
+  double dfs_rho_ms;
+  double dfs_fair_share_ms;
+  bool is_steady;
 
   // Derived options
   // Per-level target file size.

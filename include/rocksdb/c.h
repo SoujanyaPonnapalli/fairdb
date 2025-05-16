@@ -1417,6 +1417,10 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_max_background_flushes(
     rocksdb_options_t*, int);
 extern ROCKSDB_LIBRARY_API int rocksdb_options_get_max_background_flushes(
     rocksdb_options_t*);
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_max_reserve_flushes(
+    rocksdb_options_t*, int);
+extern ROCKSDB_LIBRARY_API int rocksdb_options_get_max_reserve_flushes(
+    rocksdb_options_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_max_log_file_size(
     rocksdb_options_t*, size_t);
 extern ROCKSDB_LIBRARY_API size_t
@@ -2163,6 +2167,12 @@ extern ROCKSDB_LIBRARY_API int rocksdb_env_get_background_threads(
     rocksdb_env_t* env);
 extern ROCKSDB_LIBRARY_API void
 rocksdb_env_set_high_priority_background_threads(rocksdb_env_t* env, int n);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_env_set_med_priority_background_threads(
+    rocksdb_env_t* env, int n);
+extern ROCKSDB_LIBRARY_API int
+rocksdb_env_get_med_priority_background_threads(
+    rocksdb_env_t* env);
 extern ROCKSDB_LIBRARY_API int rocksdb_env_get_high_priority_background_threads(
     rocksdb_env_t* env);
 extern ROCKSDB_LIBRARY_API void rocksdb_env_set_low_priority_background_threads(

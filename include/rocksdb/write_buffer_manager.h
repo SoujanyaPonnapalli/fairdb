@@ -91,8 +91,9 @@ class WriteBufferManager final {
           // Note: RecalculateGlobalPoolRemaining handles the overall adjustment
       }
 
-
-      RecalculateGlobalPoolRemaining(current_total_wal_size);
+      if (max_total_wal_size_ > 0) {
+        RecalculateGlobalPoolRemaining(current_total_wal_size);
+      }
       CheckEnabled();
     }
 

@@ -471,6 +471,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   IOStatus io_s;
   Status pre_release_cb_status;
   WALWriteData wal_write_data;
+  std::map<uint32_t, uint64_t> cf_size_map;
+
   if (status.ok()) {
     // Rules for when we can update the memtable concurrently
     // 1. supported by memtable
@@ -557,16 +559,14 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
     if (!two_write_queues_) {
       if (status.ok() && !write_options.disableWAL) {
-        size_t write_with_wal = 0;
-        WriteBatch* to_be_cached_state = nullptr;
-        WriteBatch* merged_batch;
-        io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch_, &merged_batch,
-                                            &write_with_wal, &to_be_cached_state));
-        std::map<uint32_t, uint64_t> cf_size_map;
         WalSizeCalculatingHandler handler(cf_size_map);
-        merged_batch->Iterate(&handler);
+        for (auto* writer : write_group) {
+          WriteBatch* batch = writer->batch;
+          batch->Iterate(&handler);
+        }
         for (const auto& [cf_id, size] : cf_size_map) {
-          MaybeScheduleFlushForWAL(cf_id, size);
+        //  MaybeScheduleFlushForWAL(cf_id, size);
+        // Add CF refs
         }
         assert(log_context.log_file_number_size);
         LogFileNumberSize& log_file_number_size =
@@ -2751,63 +2751,5 @@ Status DB::Merge(const WriteOptions& opt, ColumnFamilyHandle* column_family,
   }
   return Write(opt, &batch);
 }
-
-Status DBImpl::MaybeScheduleFlushForWAL(uint32_t cf_id, size_t write_size) {
-  mutex_.AssertHeld();
-  Status s = write_buffer_manager_->CheckCanWriteWAL(cf_id, write_size);
-
-  if (s.IsMemoryLimit()) {
-    // WAL manager indicates we need to flush this CF to make space.
-    ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(cf_id);
-
-    if (cfd == nullptr || cfd->IsDropped()) {
-      // Column family doesn't exist or is dropped, cannot flush.
-      // Return OK because the write won't happen anyway, or MemoryLimit?
-      // Let's return OK, assuming the write won't proceed for a dropped/non-existent CF.
-      return Status::OK();
-    }
-
-    if (cfd->queued_for_flush()) {
-        // Already scheduled, let the existing flush proceed.
-        // Return MemoryLimit to indicate the caller should wait/retry.
-        return s;
-    }
-
-    // Check if the CF actually has anything to flush. It might be full
-    // according to WAL limits but have an empty memtable if recently flushed.
-    if (cfd->mem()->IsEmpty()) {
-        // Nothing to flush right now. The WAL limit is tight.
-        // Still return MemoryLimit as space isn't available.
-        ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                       "[%s] WAL limit requires flush, but memtable is empty.",
-                       cfd->GetName().c_str());
-        return s;
-    }
-
-
-    // Prepare and schedule a flush for this specific column family.
-    FlushRequest req;
-    GenerateFlushRequest({cfd}, FlushReason::kWriteBufferManager, &req);
-    SchedulePendingFlush(req);
-    MaybeScheduleFlushOrCompaction(); // Wake up background thread if needed
-
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "[%s] Scheduling flush due to WALManager limit.",
-                   cfd->GetName().c_str());
-
-    // Return the original MemoryLimit status to signal the caller.
-    return s;
-  }
-
-  // Status is OK or some other error - return it directly.
-  return s;
-}
-
-// Background work management
-// ... existing BGWork functions ...
-
-// FindObsoleteFiles() requires DB lock
-// FindObsoleteFiles() calls FindObsoleteRateLimitedFiles() and FindObsoleteWALs()
-// ... existing code ...
 
 }  // namespace ROCKSDB_NAMESPACE

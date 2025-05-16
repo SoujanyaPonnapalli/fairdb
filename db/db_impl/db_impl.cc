@@ -166,6 +166,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                const bool seq_per_batch, const bool batch_per_txn,
                bool read_only)
     : dbname_(dbname),
+      flush_thread_quanta(options.flush_thread_quanta),
+      flush_thread_lmax(options.flush_thread_lmax),
+      flush_thread_k(options.flush_thread_k),
       own_info_log_(options.info_log == nullptr),
       init_logger_creation_s_(),
       initial_db_options_(SanitizeOptions(dbname, options, read_only,
@@ -211,11 +214,13 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       write_controller_(mutable_db_options_.delayed_write_rate),
       last_batch_group_size_(0),
       unscheduled_flushes_(0),
+      unscheduled_reserved_flushes_(0),
       unscheduled_compactions_(0),
       bg_bottom_compaction_scheduled_(0),
       bg_compaction_scheduled_(0),
       num_running_compactions_(0),
       bg_flush_scheduled_(0),
+      bg_reserved_flush_scheduled_(0),
       num_running_flushes_(0),
       bg_purge_scheduled_(0),
       disable_delete_obsolete_files_(0),
@@ -496,7 +501,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context) {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_) {
+         bg_flush_scheduled_ || bg_reserved_flush_scheduled_) {
     bg_cv_.Wait();
   }
 }
@@ -574,7 +579,7 @@ Status DBImpl::CloseHelper() {
 
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_flush_scheduled_ || bg_purge_scheduled_ || bg_reserved_flush_scheduled_ ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
@@ -587,7 +592,14 @@ Status DBImpl::CloseHelper() {
   trim_history_scheduler_.Clear();
 
   while (!flush_queue_.empty()) {
-    const FlushRequest& flush_req = PopFirstFromFlushQueue();
+    const FlushRequest& flush_req = PopFirstFromFlushQueue(Env::Priority::MEDIUM);
+    for (const auto& iter : flush_req.cfd_to_max_mem_id_to_persist) {
+      iter.first->UnrefAndTryDelete();
+    }
+  }
+
+  while (!flush_queue_reserve_.empty()) {
+    const FlushRequest& flush_req = PopFirstFromFlushQueue(Env::Priority::HIGH);
     for (const auto& iter : flush_req.cfd_to_max_mem_id_to_persist) {
       iter.first->UnrefAndTryDelete();
     }
@@ -1372,11 +1384,13 @@ Status DBImpl::SetDBOptions(
     if (s.ok()) {
       const BGJobLimits current_bg_job_limits =
           GetBGJobLimits(mutable_db_options_.max_background_flushes,
+                        mutable_db_options_.max_reserve_flushes,
                          mutable_db_options_.max_background_compactions,
                          mutable_db_options_.max_background_jobs,
                          /* parallelize_compactions */ true);
       const BGJobLimits new_bg_job_limits = GetBGJobLimits(
           new_options.max_background_flushes,
+          new_options.max_reserve_flushes,
           new_options.max_background_compactions,
           new_options.max_background_jobs, /* parallelize_compactions */ true);
 

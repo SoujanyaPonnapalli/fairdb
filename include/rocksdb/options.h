@@ -510,6 +510,13 @@ struct DBOptions {
   // bottlenecked by RocksDB.
   DBOptions* IncreaseParallelism(int total_threads = 16);
 
+  uint32_t flush_thread_quanta = -1;
+
+  uint32_t flush_thread_lmax = 0;
+
+  uint32_t flush_thread_k = 1;
+
+
   // If true, the database will be created if it is missing.
   // Default: false
   bool create_if_missing = false;
@@ -810,6 +817,8 @@ struct DBOptions {
   // Env::SetBackgroundThreads
   // Default: -1
   int max_background_flushes = -1;
+
+  int max_reserve_flushes = 0;
 
   // Specify the maximal size of the info log file. If the log file
   // is larger than `max_log_file_size`, a new info log file will

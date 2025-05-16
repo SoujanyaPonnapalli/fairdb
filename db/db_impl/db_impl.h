@@ -803,12 +803,14 @@ class DBImpl : public DB {
 
   struct BGJobLimits {
     int max_flushes;
+    int max_reserve_flushes;
     int max_compactions;
   };
   // Returns maximum background flushes and compactions allowed to be scheduled
   BGJobLimits GetBGJobLimits() const;
   // Need a static version that can be called during SanitizeOptions().
   static BGJobLimits GetBGJobLimits(int max_background_flushes,
+                                    int max_reserve_flushes,
                                     int max_background_compactions,
                                     int max_background_jobs,
                                     bool parallelize_compactions);
@@ -1453,7 +1455,7 @@ class DBImpl : public DB {
 
   void NotifyOnCompactionCompleted(ColumnFamilyData* cfd, Compaction* c,
                                    const Status& st,
-                                   const CompactionJobStats& job_stats,
+                                   CompactionJobStats& job_stats,
                                    int job_id);
   void NotifyOnMemTableSealed(ColumnFamilyData* cfd,
                               const MemTableInfo& mem_table_info);
@@ -2147,6 +2149,7 @@ class DBImpl : public DB {
     std::unordered_map<ColumnFamilyData*, uint64_t>
         cfd_to_max_mem_id_to_persist;
 
+    long long queue_start = 0;
 #ifndef NDEBUG
     int reschedule_count = 1;
 #endif /* !NDEBUG */
@@ -2231,7 +2234,7 @@ class DBImpl : public DB {
   // helper functions for adding and removing from flush & compaction queues
   void AddToCompactionQueue(ColumnFamilyData* cfd);
   ColumnFamilyData* PopFirstFromCompactionQueue();
-  FlushRequest PopFirstFromFlushQueue();
+  FlushRequest PopFirstFromFlushQueue(Env::Priority thread_pri);
 
   // Pick the first unthrottled compaction with task token from queue.
   ColumnFamilyData* PickCompactionFromQueue(
@@ -2641,6 +2644,79 @@ class DBImpl : public DB {
   // State is protected with db mutex.
   std::list<uint64_t> pending_outputs_;
 
+    // Class to manage flush requests with priority based on reason.
+  // WAL-related flushes (kWalFull, kWALConsistency) have lower priority.
+  class FlushRequestQueue {
+   public:
+    // Add a request to the appropriate queue.
+    void push(const FlushRequest& req) {
+      if (req.flush_reason == FlushReason::kWalFull ||
+          req.flush_reason == FlushReason::kWALConsistency) {
+        if (wal_current_in_primary_queue_ < wal_allowed_in_primary_queue_) {
+          primary_queue_.push_back(req);
+          wal_current_in_primary_queue_++;
+        } else {
+          secondary_queue_.push_back(req);
+        }
+      } else {
+        primary_queue_.push_back(req);
+      }
+    }
+
+    // Get and remove the highest priority request.
+    FlushRequest pop() {
+      assert(!empty());
+      FlushRequest req;
+      if (!primary_queue_.empty()) {
+        req = primary_queue_.front();
+        primary_queue_.pop_front();
+        if (req.flush_reason == FlushReason::kWalFull ||
+            req.flush_reason == FlushReason::kWALConsistency) {
+          wal_current_in_primary_queue_--;
+        }
+      } else {
+        req = secondary_queue_.front();
+        secondary_queue_.pop_front();
+      }
+      return req;
+    }
+
+    // Check if both queues are empty.
+    bool empty() const {
+      return primary_queue_.empty() && secondary_queue_.empty();
+    }
+
+    // Get the highest priority request without removing it.
+    const FlushRequest& front() const {
+      assert(!empty());
+      if (!primary_queue_.empty()) {
+        return primary_queue_.front();
+      } else {
+        return secondary_queue_.front();
+      }
+    }
+
+    // Get the total number of requests.
+    size_t size() const { return primary_queue_.size() + secondary_queue_.size(); }
+
+    // Provide iterators for logging or inspection purposes.
+    using const_iterator = typename std::deque<FlushRequest>::const_iterator;
+
+    const_iterator primary_begin() const { return primary_queue_.cbegin(); }
+    const_iterator primary_end() const { return primary_queue_.cend(); }
+    const_iterator secondary_begin() const { return secondary_queue_.cbegin(); }
+    const_iterator secondary_end() const { return secondary_queue_.cend(); }
+
+   private:
+    std::deque<FlushRequest> primary_queue_;    // High priority
+    std::deque<FlushRequest> secondary_queue_;  // Low priority (WAL related)
+    uint32_t wal_allowed_in_primary_queue_ = 0;
+    uint32_t wal_current_in_primary_queue_ = 0;
+  };
+
+
+  
+
   // flush_queue_ and compaction_queue_ hold column families that we need to
   // flush and compact, respectively.
   // A column family is inserted into flush_queue_ when it satisfies condition
@@ -2661,10 +2737,39 @@ class DBImpl : public DB {
   // in MaybeScheduleFlushOrCompaction()
   // invariant(column family present in flush_queue_ <==>
   // ColumnFamilyData::pending_flush_ == true)
-  std::deque<FlushRequest> flush_queue_;
+  //std::deque<FlushRequest> flush_queue_;
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
   std::deque<ColumnFamilyData*> compaction_queue_;
+
+  struct NodeCmp {
+    bool operator()(const FlushRequest& lhs, const FlushRequest& rhs) {
+      // Get CFDs from internal maps
+      ColumnFamilyData* lhs_cfd = lhs.cfd_to_max_mem_id_to_persist.begin()->first;
+      ColumnFamilyData* rhs_cfd = rhs.cfd_to_max_mem_id_to_persist.begin()->first;
+      uint32_t lhs_usage = lhs_cfd->GetCurrentThreadUsage();
+      uint32_t rhs_usage = rhs_cfd->GetCurrentThreadUsage();
+      double lhs_weight = rhs_cfd->dfs_fair_share;
+      double rhs_weight = lhs_cfd->dfs_fair_share;
+      uint64_t lhs_last_service_time =
+          lhs_cfd->GetLastServiceTime();
+      uint64_t rhs_last_service_time =
+          rhs_cfd->GetLastServiceTime();
+        if (lhs_usage/lhs_weight == rhs_usage/rhs_weight) {
+          return lhs_last_service_time > rhs_last_service_time;
+        } else {
+          return lhs_usage/lhs_weight > rhs_usage/rhs_weight;
+        }
+    }
+  };
+
+  std::priority_queue<FlushRequest, std::deque<FlushRequest>, NodeCmp>
+      flush_queue_reserve_;
+
+  std::priority_queue<FlushRequest, std::deque<FlushRequest>, NodeCmp>
+      flush_queue_;
+
+
 
   // A map to store file numbers and filenames of the files to be purged
   std::unordered_map<uint64_t, PurgeFileInfo> purge_files_;
@@ -2680,6 +2785,8 @@ class DBImpl : public DB {
 
   int unscheduled_flushes_;
 
+  int unscheduled_reserved_flushes_;
+
   int unscheduled_compactions_;
 
   // count how many background compactions are running or have been scheduled in
@@ -2694,6 +2801,8 @@ class DBImpl : public DB {
 
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_;
+
+  int bg_reserved_flush_scheduled_;
 
   // stores the number of flushes are currently running
   int num_running_flushes_;
@@ -2898,8 +3007,6 @@ class DBImpl : public DB {
   // Overload likely called during recovery/flush where log_ptr is known
   void AddWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
     const uint32_t cfid, ColumnFamilyData* cfd) {
-      // Lock the DBImpl attribution mutex
-      InstrumentedMutexLock lock(&attribution_mutex_);
 
       // Add attribution to the column family object
       cfd->AddWALAttribution(log_size);
@@ -2916,9 +3023,6 @@ class DBImpl : public DB {
 
   void DeductWALAttribution(LogFileNumberSize* log_ptr, const uint64_t log_size,
     const uint32_t cfid, ColumnFamilyData* cfd) {
-      // Lock the DBImpl attribution mutex
-      InstrumentedMutexLock lock(&attribution_mutex_);
-
       // Deduct attribution from the column family object
       cfd->DeductWALAttribution(log_size);
 
@@ -3136,6 +3240,134 @@ class DBImpl : public DB {
   void close_WAL_logging() {
     WALlogFile.close();
   }
+
+    
+  const uint32_t flush_thread_quanta;
+
+  const uint32_t flush_thread_lmax;
+
+  const uint32_t flush_thread_k;
+
+  void log_flush_stats(ColumnFamilyData* cfd, uint64_t thread_time, std::string operation) {
+    std::ostringstream oss;
+    long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    oss << operation+"_stats, " << timestamp << ", "
+        << cfd->GetName() << ", " << thread_time;
+    WAL_log_unlimited(oss.str());
+  }
+
+  void DFSStartFlush(ColumnFamilyData* cfd) {
+    cfd->SetLastFlushStartTime(std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+  }
+
+  void DFSEndFlush(ColumnFamilyData* cfd) {
+    uint64_t dur_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() -
+        cfd->GetLastFlushStartTime();
+    if (dur_ms > 0) {
+      log_flush_stats(cfd, dur_ms, "flush");
+    }
+  }
+
+  void DFSEndCompaction(ColumnFamilyData* cfd, CompactionJobStats& stats) {
+    uint64_t dur_ms = stats.cpu_micros / 1000;
+    if (dur_ms > 0) {
+      log_flush_stats(cfd, dur_ms, "compaction");
+    }
+  }
+
+  void DFSStartFlushQueue(ColumnFamilyData* cfd) {
+    cfd->AddFlushQueueTime(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+  }
+
+  void DFSStartCompactionQueue(ColumnFamilyData* cfd) {
+    cfd->AddCompactionQueueTime(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+  }
+
+  void DFSEndFlushQueue(ColumnFamilyData* cfd) {
+    uint64_t dur_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() -
+        cfd->GetFlushQueueTime();
+    if (dur_ms > 0) {
+      log_flush_stats(cfd, dur_ms, "flush_queue");
+    }
+  }
+
+
+  void DFSEndCompactionQueue(ColumnFamilyData* cfd) {
+    uint64_t dur_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() -
+        cfd->GetCompactionQueueTime();
+    if (dur_ms > 0) {
+      log_flush_stats(cfd, dur_ms, "compaction_queue");
+    }
+  }
+
+  uint64_t NowTick() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() / (flush_thread_quanta * 1ULL);
+  }
+
+  // void LogCFCreditStats(ColumnFamilyData* cfd) {
+  //   std::ostringstream oss;
+  //   long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //       std::chrono::system_clock::now().time_since_epoch()).count();
+  //   oss << "credit_stats, " << timestamp << ", "
+  //       << cfd->GetName() << ", " << cfd->dfs_credit_ms << ", " << cfd->dfs_fair_share_ms << ", " << cfd->dfs_rho_ms << ", " << cfd->dfs_delta_ms;
+  //   WAL_log_unlimited(oss.str());
+  // }
+
+  // FlushRequest DFSPickRequest() {
+  //   uint64_t now = NowTick();
+  //   auto best_it = flush_queue_.end();
+  //   double best_credit = std::numeric_limits<double>::lowest();
+  
+  //   for (auto it = flush_queue_.begin(); it != flush_queue_.end(); ++it) {
+  //     if (it->cfd_to_max_mem_id_to_persist.empty()) continue;   // guard
+  
+  //     ColumnFamilyData* cfd = it->cfd_to_max_mem_id_to_persist.begin()->first;
+  //     if (cfd->GetName() == "cf15") {
+  //       best_it = it;
+  //       break;
+  //     }
+  //     uint64_t ticks_passed = now - cfd->dfs_last_tick;
+  //     if (ticks_passed) {
+  //       cfd->dfs_credit_ms += ticks_passed * (cfd->dfs_fair_share_ms + cfd->dfs_rho_ms);
+  //       double cfd_max_credit;
+  //       if (cfd->is_steady) {
+  //         cfd_max_credit = cfd->dfs_delta_ms * (cfd->dfs_fair_share_ms / flush_thread_quanta);
+  //       } else {
+  //         cfd_max_credit = cfd->dfs_fair_share_ms;
+  //       }
+  //       if (cfd->dfs_credit_ms > cfd_max_credit) {
+  //         cfd->dfs_credit_ms = cfd_max_credit;
+  //       }
+  //       cfd->dfs_last_tick = now;
+  //     }
+  //     if (cfd->dfs_credit_ms > best_credit) {
+  //       best_credit = cfd->dfs_credit_ms;
+  //       best_it = it;
+  //     }
+  //     LogCFCreditStats(cfd);
+  //   }
+  //   assert(best_it != flush_queue_.end());
+
+  //   FlushRequest picked = std::move(*best_it);
+  //   flush_queue_.erase(best_it);
+  //   return picked;
+  // }
+
+
+  
 
   long atomic_counter = 0;
   std::mutex atomic_counter_mutex;

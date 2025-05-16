@@ -374,6 +374,7 @@ void CompactionJob::AcquireSubcompactionResources(
   int max_db_compactions =
       DBImpl::GetBGJobLimits(
           mutable_db_options_copy_.max_background_flushes,
+          mutable_db_options_copy_.max_reserve_flushes,
           mutable_db_options_copy_.max_background_compactions,
           mutable_db_options_copy_.max_background_jobs,
           versions_->GetColumnFamilySet()

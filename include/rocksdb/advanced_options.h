@@ -148,6 +148,12 @@ enum class PrepopulateBlobCache : uint8_t {
 };
 
 struct AdvancedColumnFamilyOptions {
+  uint32_t dfs_delta_ms = 0;
+  double dfs_weight = 1;
+  double dfs_rho_ms = 0;
+  double dfs_fair_share_ms = -1; 
+  bool is_steady = false;
+
   // The maximum number of write buffers that are built up in memory.
   // The default and the minimum number is 2, so that when 1 write buffer
   // is being flushed to storage, new writes can continue to the other

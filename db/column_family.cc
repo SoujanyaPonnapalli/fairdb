@@ -564,7 +564,16 @@ ColumnFamilyData::ColumnFamilyData(
       last_memtable_id_(0),
       db_paths_registered_(false),
       mempurge_used_(false),
-      next_epoch_number_(1) {
+      next_epoch_number_(1),
+      dfs_delta_ms(cf_options.dfs_delta_ms),
+      dfs_weight(cf_options.dfs_weight),
+      dfs_fair_share(cf_options.dfs_fair_share_ms),
+      dfs_rho_ms(cf_options.dfs_rho_ms),
+      dfs_credit_ms(cf_options.dfs_rho_ms),
+      dfs_last_tick(0),
+      current_thread_usage(0),
+      dfs_last_service_time(0),
+      is_steady(cf_options.is_steady) {
   if (id_ != kDummyColumnFamilyDataId) {
     // TODO(cc): RegisterDbPaths can be expensive, considering moving it
     // outside of this constructor which might be called with db mutex held.
