@@ -418,7 +418,11 @@ Status DBImpl::FlushMemTablesToOutputFiles(
   }
 
   InitSnapshotContext(job_context);
-
+  std::vector<SequenceNumber> snapshot_seqs;
+  SequenceNumber earliest_write_conflict_snapshot;
+  SnapshotChecker* snapshot_checker;
+  GetSnapshotContext(job_context, &snapshot_seqs,
+                     &earliest_write_conflict_snapshot, &snapshot_checker);
   const auto& bg_flush_arg = bg_flush_args[0];
   ColumnFamilyData* cfd = bg_flush_arg.cfd_;
   // intentional infrequent copy for each flush

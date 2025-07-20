@@ -369,6 +369,25 @@ Status DBImpl::IngestWBWIAsMemtable(
   return s;
 }
 
+class IterationStopException : public std::exception {};
+class PutInspector : public rocksdb::WriteBatch::Handler {
+public:
+  virtual rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
+    (void) key;
+    (void) value;
+    column_family_id_ = column_family_id;
+    // std::cout << "Put Operation in CF " << column_family_id << " - Key: " << key.ToString() << std::endl;
+    throw IterationStopException();
+    return rocksdb::Status::OK();
+  }
+  uint32_t GetCFID() { return column_family_id_; }
+private:
+  uint32_t column_family_id_ = 99;
+};
+
+// The main write queue. This is the only write queue that updates LastSequence.
+// When using one write queue, the same sequence also indicates the last
+// published sequence.
 Status DBImpl::WriteImpl(const WriteOptions& write_options,
                          WriteBatch* my_batch, WriteCallback* callback,
                          UserWriteCallback* user_write_cb, uint64_t* wal_used,
@@ -663,6 +682,32 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   if (wbwi) {
     assert(write_group.size == 1);
   }
+
+  // size_t num_cfs = 2;
+  // for (size_t i = 0; i < num_cfs; ++i) {
+  //   last_batch_sizes_[i] = 0;
+  // }
+  
+  // // size_t last_batch_sizes[num_cfs] = {0, 0};
+
+  // for (auto w_it = write_group.begin(); w_it != write_group.end(); ++w_it) {
+  //   rocksdb::WriteThread::Writer* cur_w = w_it.writer;
+  //   size_t batch_size = WriteBatchInternal::ByteSize(cur_w->batch);
+
+  //   PutInspector inspector;
+  //   try {
+  //     w.batch->Iterate(&inspector);
+  //   } catch (const IterationStopException& e) {
+  //     // Stopped iteration after a single Put(). That's enough to identify CF.
+  //   }
+  //   uint32_t cf_id = inspector.GetCFID();
+  //   last_batch_sizes_[cf_id] += batch_size;
+  //   // std::cout << "[TGRIGGS_LOG] batch size = " << batch_size << ", cf_id = " << cf_id << std::endl;
+  // }
+
+  // for (int i = 0; i < num_cfs; ++i) {
+  //   std::cout << "[TGRIGGS_LOG] cf_id=" << i << ", size=" << last_batch_sizes[i] << std::endl;
+  // }
 
   // size_t num_cfs = 2;
   // for (size_t i = 0; i < num_cfs; ++i) {

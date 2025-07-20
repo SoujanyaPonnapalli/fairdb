@@ -225,7 +225,6 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       blob_callback_(immutable_db_options_.sst_file_manager.get(), &mutex_,
                      &error_handler_, &event_logger_,
                      immutable_db_options_.listeners, dbname_) {
-
   for (int i = 0; i < 2; ++i) {
     write_controllers_.push_back(std::make_shared<WriteController>(mutable_db_options_.delayed_write_rate));
   }
@@ -5062,6 +5061,23 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
     cfd->current()->GetColumnFamilyMetaData(cf_meta);
+  }
+}
+
+void DBImpl::GetCFMemTableStats() {
+  InstrumentedMutexLock l(&mutex_);
+  for (auto cfd : *(versions_->GetColumnFamilySet())) {
+    {
+      std::cout << "memtables," << cfd->GetName() << "," 
+        << cfd->imm()->NumNotFlushed() + 1
+        << "," << (cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage()) / (1024*1024) << "MB\n";
+
+      // cfd->GetName();
+      // cfd->mem().size() + cfd->imm()->NumNotFlushed();
+
+      // cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage();
+      // cfd->current()->GetColumnFamilyMetaData(&metadata->back());
+    }
   }
 }
 
