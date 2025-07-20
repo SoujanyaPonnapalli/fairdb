@@ -257,8 +257,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                                    [this]() { this->FlushInfoLog(); });
   periodic_task_functions_.emplace(
     PeriodicTaskType::kRecordSeqnoTime, [this]() {
-      this->RecordSeqnoToTimeMapping(/*populate_historical_seconds=*/0);
+      this->RecordSeqnoToTimeMapping();
     });
+  periodic_task_functions_.emplace(
     PeriodicTaskType::kTriggerCompaction,
     [this]() { this->TriggerPeriodicCompaction(); });
 
@@ -5061,23 +5062,6 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
     cfd->current()->GetColumnFamilyMetaData(cf_meta);
-  }
-}
-
-void DBImpl::GetCFMemTableStats() {
-  InstrumentedMutexLock l(&mutex_);
-  for (auto cfd : *(versions_->GetColumnFamilySet())) {
-    {
-      std::cout << "memtables," << cfd->GetName() << "," 
-        << cfd->imm()->NumNotFlushed() + 1
-        << "," << (cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage()) / (1024*1024) << "MB\n";
-
-      // cfd->GetName();
-      // cfd->mem().size() + cfd->imm()->NumNotFlushed();
-
-      // cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage();
-      // cfd->current()->GetColumnFamilyMetaData(&metadata->back());
-    }
   }
 }
 
