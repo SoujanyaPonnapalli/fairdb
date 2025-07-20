@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/utilities/debug.h"
 
 #include "db/db_impl/db_impl.h"
@@ -54,7 +53,7 @@ std::string KeyVersion::GetTypeName() const {
   }
 }
 
-Status GetAllKeyVersions(DB* db, Slice begin_key, Slice end_key,
+Status GetAllKeyVersions(DB* db, OptSlice begin_key, OptSlice end_key,
                          size_t max_num_ikeys,
                          std::vector<KeyVersion>* key_versions) {
   if (nullptr == db) {
@@ -64,8 +63,8 @@ Status GetAllKeyVersions(DB* db, Slice begin_key, Slice end_key,
                            max_num_ikeys, key_versions);
 }
 
-Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
-                         Slice end_key, size_t max_num_ikeys,
+Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, OptSlice begin_key,
+                         OptSlice end_key, size_t max_num_ikeys,
                          std::vector<KeyVersion>* key_versions) {
   if (nullptr == db) {
     return Status::InvalidArgument("db cannot be null.");
@@ -82,12 +81,19 @@ Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
   auto icmp = InternalKeyComparator(idb->GetOptions(cfh).comparator);
   ReadOptions read_options;
   Arena arena;
-  ScopedArenaIterator iter(
+  ScopedArenaPtr<InternalIterator> iter(
       idb->NewInternalIterator(read_options, &arena, kMaxSequenceNumber, cfh));
 
-  if (!begin_key.empty()) {
+  const Comparator* ucmp = icmp.user_comparator();
+  size_t ts_sz = ucmp->timestamp_size();
+
+  std::string begin_key_buf, end_key_buf;
+  auto [from, end] = MaybeAddTimestampsToRange(begin_key, end_key, ts_sz,
+                                               &begin_key_buf, &end_key_buf);
+  if (begin_key.has_value()) {
+    assert(from.has_value());
     InternalKey ikey;
-    ikey.SetMinPossibleForUserKey(begin_key);
+    ikey.SetMinPossibleForUserKey(from.value());
     iter->Seek(ikey.Encode());
   } else {
     iter->SeekToFirst();
@@ -102,8 +108,8 @@ Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
       return pik_status;
     }
 
-    if (!end_key.empty() &&
-        icmp.user_comparator()->Compare(ikey.user_key, end_key) > 0) {
+    if (end_key.has_value() && end.has_value() &&
+        icmp.user_comparator()->Compare(ikey.user_key, end.value()) > 0) {
       break;
     }
 
@@ -119,4 +125,3 @@ Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

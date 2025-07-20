@@ -3,10 +3,11 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
+#include "rocksdb/utilities/options_util.h"
 #include "table/unique_id_impl.h"
+#include "utilities/merge_operators/string_append/stringappend.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -21,8 +22,10 @@ class MyTestCompactionService : public CompactionService {
       : db_path_(std::move(db_path)),
         options_(options),
         statistics_(statistics),
-        start_info_("na", "na", "na", 0, Env::TOTAL),
-        wait_info_("na", "na", "na", 0, Env::TOTAL),
+        start_info_("na", "na", "na", 0, "na", 0, Env::TOTAL,
+                    CompactionReason::kUnknown, false, false, false, -1, -1),
+        wait_info_("na", "na", "na", 0, "na", 0, Env::TOTAL,
+                   CompactionReason::kUnknown, false, false, false, -1, -1),
         listeners_(listeners),
         table_properties_collector_factories_(
             std::move(table_properties_collector_factories)) {}
@@ -82,6 +85,7 @@ class MyTestCompactionService : public CompactionService {
     options_override.table_factory = options_.table_factory;
     options_override.sst_partitioner_factory = options_.sst_partitioner_factory;
     options_override.statistics = statistics_;
+    options_override.info_log = options_.info_log;
     if (!listeners_.empty()) {
       options_override.listeners = listeners_;
     }
@@ -97,8 +101,12 @@ class MyTestCompactionService : public CompactionService {
     Status s =
         DB::OpenAndCompact(options, db_path_, db_path_ + "/" + scheduled_job_id,
                            compaction_input, result, options_override);
-    if (is_override_wait_result_) {
-      *result = override_wait_result_;
+    {
+      InstrumentedMutexLock l(&mutex_);
+      if (is_override_wait_result_) {
+        *result = override_wait_result_;
+      }
+      result_ = *result;
     }
     compaction_num_.fetch_add(1);
     if (s.ok()) {
@@ -106,6 +114,13 @@ class MyTestCompactionService : public CompactionService {
     } else {
       return CompactionServiceJobStatus::kFailure;
     }
+  }
+
+  void CancelAwaitingJobs() override { canceled_ = true; }
+
+  void OnInstallation(const std::string& /*scheduled_job_id*/,
+                      CompactionServiceJobStatus status) override {
+    final_updated_status_ = status;
   }
 
   int GetCompactionNum() { return compaction_num_.load(); }
@@ -135,6 +150,15 @@ class MyTestCompactionService : public CompactionService {
   }
 
   void SetCanceled(bool canceled) { canceled_ = canceled; }
+  bool GetCanceled() { return canceled_; }
+
+  void GetResult(CompactionServiceResult* deserialized) {
+    CompactionServiceResult::Read(result_, deserialized).PermitUncheckedError();
+  }
+
+  CompactionServiceJobStatus GetFinalCompactionServiceJobStatus() {
+    return final_updated_status_.load();
+  }
 
  private:
   InstrumentedMutex mutex_;
@@ -153,11 +177,14 @@ class MyTestCompactionService : public CompactionService {
   CompactionServiceJobStatus override_wait_status_ =
       CompactionServiceJobStatus::kFailure;
   bool is_override_wait_result_ = false;
+  std::string result_;
   std::string override_wait_result_;
   std::vector<std::shared_ptr<EventListener>> listeners_;
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
       table_properties_collector_factories_;
   std::atomic_bool canceled_{false};
+  std::atomic<CompactionServiceJobStatus> final_updated_status_{
+      CompactionServiceJobStatus::kUseLocal};
 };
 
 class CompactionServiceTest : public DBTestBase {
@@ -172,12 +199,15 @@ class CompactionServiceTest : public DBTestBase {
     options->statistics = primary_statistics_;
     compactor_statistics_ = CreateDBStatistics();
 
-    compaction_service_ = std::make_shared<MyTestCompactionService>(
+    auto my_cs = std::make_shared<MyTestCompactionService>(
         dbname_, *options, compactor_statistics_, remote_listeners,
         remote_table_properties_collector_factories);
+
+    compaction_service_ = my_cs;
     options->compaction_service = compaction_service_;
     DestroyAndReopen(*options);
     CreateAndReopenWithCF({"cf_1", "cf_2", "cf_3"}, *options);
+    my_cs->SetCanceled(false);
   }
 
   Statistics* GetCompactorStatistics() { return compactor_statistics_.get(); }
@@ -249,12 +279,23 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   Statistics* primary_statistics = GetPrimaryStatistics();
   Statistics* compactor_statistics = GetCompactorStatistics();
 
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTable::PrefetchTail::TaiSizeNotRecorded",
+      [&](void* /* arg */) {
+        // Trigger assertion to verify precise tail prefetch size calculation
+        assert(false);
+      });
+
+  SyncPoint::GetInstance()->EnableProcessing();
   GenerateTestData();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  SyncPoint::GetInstance()->DisableProcessing();
   VerifyTestData();
 
   auto my_cs = GetCompactionService();
   ASSERT_GE(my_cs->GetCompactionNum(), 1);
+  ASSERT_EQ(CompactionServiceJobStatus::kSuccess,
+            my_cs->GetFinalCompactionServiceJobStatus());
 
   // make sure the compaction statistics is only recorded on the remote side
   ASSERT_GE(compactor_statistics->getTickerCount(COMPACT_WRITE_BYTES), 1);
@@ -315,10 +356,42 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
         assert(*id != kNullUniqueId64x2);
         verify_passed++;
       });
+  Close();
+  my_cs->SetCanceled(false);
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"},
                            options);
   ASSERT_GT(verify_passed, 0);
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  if (s.IsAborted()) {
+    ASSERT_NOK(result.status);
+  } else {
+    ASSERT_OK(result.status);
+  }
+  ASSERT_GE(result.internal_stats.output_level_stats.micros, 1);
+  ASSERT_GE(result.internal_stats.output_level_stats.cpu_micros, 1);
+
+  ASSERT_EQ(20, result.internal_stats.output_level_stats.num_output_records);
+  ASSERT_EQ(result.output_files.size(),
+            result.internal_stats.output_level_stats.num_output_files);
+
+  uint64_t total_size = 0;
+  for (auto output_file : result.output_files) {
+    std::string file_name = result.output_path + "/" + output_file.file_name;
+
+    uint64_t file_size = 0;
+    ASSERT_OK(options.env->GetFileSize(file_name, &file_size));
+    ASSERT_GT(file_size, 0);
+    total_size += file_size;
+  }
+  ASSERT_EQ(total_size, result.internal_stats.TotalBytesWritten());
+
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_FALSE(result.stats.is_full_compaction);
+
   Close();
+  SyncPoint::GetInstance()->DisableProcessing();
 }
 
 TEST_F(CompactionServiceTest, ManualCompaction) {
@@ -356,6 +429,617 @@ TEST_F(CompactionServiceTest, ManualCompaction) {
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
   ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
   VerifyTestData();
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+
+  auto info = my_cs->GetCompactionInfoForStart();
+  ASSERT_EQ(0, info.cf_id);
+  ASSERT_EQ(kDefaultColumnFamilyName, info.cf_name);
+
+  info = my_cs->GetCompactionInfoForWait();
+  ASSERT_EQ(0, info.cf_id);
+  ASSERT_EQ(kDefaultColumnFamilyName, info.cf_name);
+
+  // Test non-default CF
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr, nullptr));
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+
+  info = my_cs->GetCompactionInfoForStart();
+  ASSERT_EQ(handles_[1]->GetID(), info.cf_id);
+  ASSERT_EQ(handles_[1]->GetName(), info.cf_name);
+
+  info = my_cs->GetCompactionInfoForWait();
+  ASSERT_EQ(handles_[1]->GetID(), info.cf_id);
+  ASSERT_EQ(handles_[1]->GetName(), info.cf_name);
+}
+
+TEST_F(CompactionServiceTest, CompactionOutputFileIOError) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::FinishCompactionOutputFile()::AfterFinish",
+      [&](void* status) {
+        // override status
+        auto s = static_cast<Status*>(status);
+        *s = Status::IOError("Injected IOError!");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ASSERT_NOK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_NOK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, PreservedOptionsLocalCompaction) {
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  for (auto i = 0; i < 2; ++i) {
+    for (auto j = 0; j < 10; ++j) {
+      ASSERT_OK(
+          Put("foo" + std::to_string(i * 10 + j), rnd.RandomString(1024)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::Processing", [&](void* arg) {
+        auto compaction = static_cast<Compaction*>(arg);
+        std::string options_file_name = OptionsFileName(
+            dbname_,
+            compaction->input_version()->version_set()->options_file_number());
+
+        // Change option twice to make sure the very first OPTIONS file gets
+        // purged
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "4"}}));
+        ASSERT_EQ(4, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "6"}}));
+        ASSERT_EQ(6, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        dbfull()->TEST_DeleteObsoleteFiles();
+
+        // For non-remote compactions, OPTIONS file can be deleted while
+        // using option at the start of the compaction
+        Status s = env_->FileExists(options_file_name);
+        ASSERT_NOK(s);
+        ASSERT_TRUE(s.IsNotFound());
+        // Should be old value
+        ASSERT_EQ(2, compaction->mutable_cf_options()
+                         .level0_file_num_compaction_trigger);
+        ASSERT_TRUE(dbfull()->min_options_file_numbers_.empty());
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  Status s = dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(s.ok());
+}
+
+TEST_F(CompactionServiceTest, PreservedOptionsRemoteCompaction) {
+  // For non-remote compaction do not preserve options file
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  Random rnd(301);
+  for (auto i = 0; i < 2; ++i) {
+    for (auto j = 0; j < 10; ++j) {
+      ASSERT_OK(
+          Put("foo" + std::to_string(i * 10 + j), rnd.RandomString(1024)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
+      {{"CompactionServiceTest::OptionsFileChanged",
+        "DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:1"}});
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:0",
+      [&](void* arg) {
+        auto options_file_number = static_cast<uint64_t*>(arg);
+        // Change the option twice before the compaction run
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "4"}}));
+        ASSERT_EQ(4, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        ASSERT_TRUE(dbfull()->versions_->options_file_number() >
+                    *options_file_number);
+
+        // Change the option twice before the compaction run
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "5"}}));
+        ASSERT_EQ(5, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        ASSERT_TRUE(dbfull()->versions_->options_file_number() >
+                    *options_file_number);
+
+        TEST_SYNC_POINT("CompactionServiceTest::OptionsFileChanged");
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto input = static_cast<CompactionServiceInput*>(arg);
+        std::string options_file_name =
+            OptionsFileName(dbname_, input->options_file_number);
+
+        ASSERT_OK(env_->FileExists(options_file_name));
+        ASSERT_FALSE(dbfull()->min_options_file_numbers_.empty());
+        ASSERT_EQ(dbfull()->min_options_file_numbers_.front(),
+                  input->options_file_number);
+
+        DBOptions db_options;
+        ConfigOptions config_options;
+        std::vector<ColumnFamilyDescriptor> all_column_families;
+        config_options.env = env_;
+        ASSERT_OK(LoadOptionsFromFile(config_options, options_file_name,
+                                      &db_options, &all_column_families));
+        bool has_cf = false;
+        for (auto& cf : all_column_families) {
+          if (cf.name == input->cf_name) {
+            // Should be old value
+            ASSERT_EQ(2, cf.options.level0_file_num_compaction_trigger);
+            has_cf = true;
+          }
+        }
+        ASSERT_TRUE(has_cf);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::Processing", [&](void* arg) {
+        auto compaction = static_cast<Compaction*>(arg);
+        ASSERT_EQ(2, compaction->mutable_cf_options()
+                         .level0_file_num_compaction_trigger);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  Status s = dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(s.ok());
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+class EventVerifier : public EventListener {
+ public:
+  explicit EventVerifier(uint64_t expected_num_input_records,
+                         size_t expected_num_input_files,
+                         uint64_t expected_num_output_records,
+                         size_t expected_num_output_files,
+                         const std::string& expected_smallest_output_key_prefix,
+                         const std::string& expected_largest_output_key_prefix,
+                         bool expected_is_remote_compaction_on_begin,
+                         bool expected_is_remote_compaction_on_complete)
+      : expected_num_input_records_(expected_num_input_records),
+        expected_num_input_files_(expected_num_input_files),
+        expected_num_output_records_(expected_num_output_records),
+        expected_num_output_files_(expected_num_output_files),
+        expected_smallest_output_key_prefix_(
+            expected_smallest_output_key_prefix),
+        expected_largest_output_key_prefix_(expected_largest_output_key_prefix),
+        expected_is_remote_compaction_on_begin_(
+            expected_is_remote_compaction_on_begin),
+        expected_is_remote_compaction_on_complete_(
+            expected_is_remote_compaction_on_complete) {}
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_EQ(expected_num_input_files_, ci.input_files.size());
+    ASSERT_EQ(expected_num_input_files_, ci.input_file_infos.size());
+    ASSERT_EQ(expected_is_remote_compaction_on_begin_,
+              ci.stats.is_remote_compaction);
+    ASSERT_TRUE(ci.stats.is_manual_compaction);
+    ASSERT_FALSE(ci.stats.is_full_compaction);
+  }
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_GT(ci.stats.elapsed_micros, 0);
+    ASSERT_GT(ci.stats.cpu_micros, 0);
+    ASSERT_EQ(expected_num_input_records_, ci.stats.num_input_records);
+    ASSERT_EQ(expected_num_input_files_, ci.stats.num_input_files);
+    ASSERT_EQ(expected_num_output_records_, ci.stats.num_output_records);
+    ASSERT_EQ(expected_num_output_files_, ci.stats.num_output_files);
+    ASSERT_EQ(expected_smallest_output_key_prefix_,
+              ci.stats.smallest_output_key_prefix);
+    ASSERT_EQ(expected_largest_output_key_prefix_,
+              ci.stats.largest_output_key_prefix);
+    ASSERT_GT(ci.stats.total_input_bytes, 0);
+    ASSERT_GT(ci.stats.total_output_bytes, 0);
+    ASSERT_EQ(ci.stats.num_input_records,
+              ci.stats.num_output_records + ci.stats.num_records_replaced);
+    ASSERT_EQ(expected_is_remote_compaction_on_complete_,
+              ci.stats.is_remote_compaction);
+    ASSERT_TRUE(ci.stats.is_manual_compaction);
+    ASSERT_FALSE(ci.stats.is_full_compaction);
+  }
+
+ private:
+  uint64_t expected_num_input_records_;
+  size_t expected_num_input_files_;
+  uint64_t expected_num_output_records_;
+  size_t expected_num_output_files_;
+  std::string expected_smallest_output_key_prefix_;
+  std::string expected_largest_output_key_prefix_;
+  bool expected_is_remote_compaction_on_begin_;
+  bool expected_is_remote_compaction_on_complete_;
+};
+
+TEST_F(CompactionServiceTest, VerifyStats) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  auto event_verifier = std::make_shared<EventVerifier>(
+      30 /* expected_num_input_records */, 3 /* expected_num_input_files */,
+      20 /* expected_num_output_records */, 1 /* expected_num_output_files */,
+      "key00000" /* expected_smallest_output_key_prefix */,
+      "key00001" /* expected_largest_output_key_prefix */,
+      true /* expected_is_remote_compaction_on_begin */,
+      true /* expected_is_remote_compaction_on_complete */);
+  options.listeners.push_back(event_verifier);
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(0);
+  std::string end_str = Key(1);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+  VerifyTestData();
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, VerifyStatsLocalFallback) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  auto event_verifier = std::make_shared<EventVerifier>(
+      30 /* expected_num_input_records */, 3 /* expected_num_input_files */,
+      20 /* expected_num_output_records */, 1 /* expected_num_output_files */,
+      "key00000" /* expected_smallest_output_key_prefix */,
+      "key00001" /* expected_largest_output_key_prefix */,
+      true /* expected_is_remote_compaction_on_begin */,
+      false /* expected_is_remote_compaction_on_complete */);
+  options.listeners.push_back(event_verifier);
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kUseLocal);
+
+  std::string start_str = Key(0);
+  std::string end_str = Key(1);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  // Remote Compaction did not happen
+  ASSERT_EQ(my_cs->GetCompactionNum(), comp_num);
+  VerifyTestData();
+}
+
+TEST_F(CompactionServiceTest, VerifyInputRecordCount) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  // Only iterator through 10 keys and force compaction to finish.
+  int num_iter = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::stop", [&](void* stop_ptr) {
+        num_iter++;
+        if (num_iter == 10) {
+          *(bool*)stop_ptr = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // CompactRange() should fail
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsCorruption());
+  const char* expected_message =
+      "Compaction number of input keys does not match number of keys "
+      "processed.";
+  ASSERT_TRUE(std::strstr(s.getState(), expected_message));
+
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CompactionServiceTest, CorruptedOutput) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+        CompactionServiceResult* compaction_result =
+            *(static_cast<CompactionServiceResult**>(arg));
+        ASSERT_TRUE(compaction_result != nullptr &&
+                    !compaction_result->output_files.empty());
+        // Corrupt files here
+        for (const auto& output_file : compaction_result->output_files) {
+          std::string file_name =
+              compaction_result->output_path + "/" + output_file.file_name;
+
+          uint64_t file_size = 0;
+          Status s = options.env->GetFileSize(file_name, &file_size);
+          ASSERT_OK(s);
+          ASSERT_GT(file_size, 0);
+
+          ASSERT_OK(test::CorruptFile(env_, file_name, 0,
+                                      static_cast<int>(file_size),
+                                      true /* verifyChecksum */));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // CompactRange() should fail
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsCorruption());
+
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // On the worker side, the compaction is considered success
+  // Verification is done on the primary side
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, CorruptedOutputParanoidFileCheck) {
+  for (bool paranoid_file_check_enabled : {false, true}) {
+    SCOPED_TRACE("paranoid_file_check_enabled=" +
+                 std::to_string(paranoid_file_check_enabled));
+
+    Options options = CurrentOptions();
+    Destroy(options);
+    options.disable_auto_compactions = true;
+    options.paranoid_file_checks = paranoid_file_check_enabled;
+    ReopenWithCompactionService(&options);
+    GenerateTestData();
+
+    auto my_cs = GetCompactionService();
+
+    std::string start_str = Key(15);
+    std::string end_str = Key(45);
+    Slice start(start_str);
+    Slice end(end_str);
+    uint64_t comp_num = my_cs->GetCompactionNum();
+
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+        "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+          CompactionServiceResult* compaction_result =
+              *(static_cast<CompactionServiceResult**>(arg));
+          ASSERT_TRUE(compaction_result != nullptr &&
+                      !compaction_result->output_files.empty());
+          // Corrupt files here
+          for (const auto& output_file : compaction_result->output_files) {
+            std::string file_name =
+                compaction_result->output_path + "/" + output_file.file_name;
+
+            // Corrupt very small range of bytes. This corruption is so small
+            // that this isn't caught by default light-weight check
+            ASSERT_OK(test::CorruptFile(env_, file_name, 0, 1,
+                                        false /* verifyChecksum */));
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+    if (paranoid_file_check_enabled) {
+      ASSERT_NOK(s);
+      ASSERT_EQ(Status::Corruption("Paranoid checksums do not match"), s);
+    } else {
+      // CompactRange() goes through if paranoid file check is not enabled
+      ASSERT_OK(s);
+    }
+
+    ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    // On the worker side, the compaction is considered success
+    // Verification is done on the primary side
+    CompactionServiceResult result;
+    my_cs->GetResult(&result);
+    ASSERT_OK(result.status);
+    ASSERT_TRUE(result.stats.is_manual_compaction);
+    ASSERT_TRUE(result.stats.is_remote_compaction);
+  }
+}
+
+TEST_F(CompactionServiceTest, TruncatedOutput) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  // Skip calculating tail size to avoid crashing due to truncated file size
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "FileMetaData::CalculateTailSize", [&](void* arg) {
+        bool* skip = static_cast<bool*>(arg);
+        *skip = true;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+        CompactionServiceResult* compaction_result =
+            *(static_cast<CompactionServiceResult**>(arg));
+        ASSERT_TRUE(compaction_result != nullptr &&
+                    !compaction_result->output_files.empty());
+        // Truncate files here
+        for (const auto& output_file : compaction_result->output_files) {
+          std::string file_name =
+              compaction_result->output_path + "/" + output_file.file_name;
+
+          uint64_t file_size = 0;
+          Status s = options.env->GetFileSize(file_name, &file_size);
+          ASSERT_OK(s);
+          ASSERT_GT(file_size, 0);
+
+          ASSERT_OK(test::TruncateFile(env_, file_name, file_size / 4));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // CompactRange() should fail
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsCorruption());
+
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // On the worker side, the compaction is considered success
+  // Verification is done on the primary side
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, CustomFileChecksum) {
+  Options options = CurrentOptions();
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+        CompactionServiceResult* compaction_result =
+            *(static_cast<CompactionServiceResult**>(arg));
+        ASSERT_TRUE(compaction_result != nullptr &&
+                    !compaction_result->output_files.empty());
+        // Validate Checksum files here
+        for (const auto& output_file : compaction_result->output_files) {
+          std::string file_name =
+              compaction_result->output_path + "/" + output_file.file_name;
+
+          FileChecksumGenContext gen_context;
+          gen_context.file_name = file_name;
+          std::unique_ptr<FileChecksumGenerator> file_checksum_gen =
+              options.file_checksum_gen_factory->CreateFileChecksumGenerator(
+                  gen_context);
+
+          std::unique_ptr<SequentialFile> file_reader;
+          uint64_t file_size = 0;
+          Status s = options.env->GetFileSize(file_name, &file_size);
+          ASSERT_OK(s);
+          ASSERT_GT(file_size, 0);
+
+          s = options.env->NewSequentialFile(file_name, &file_reader,
+                                             EnvOptions());
+          ASSERT_OK(s);
+
+          Slice result;
+          std::unique_ptr<char[]> scratch(new char[file_size]);
+          s = file_reader->Read(file_size, &result, scratch.get());
+          ASSERT_OK(s);
+
+          file_checksum_gen->Update(scratch.get(), result.size());
+          file_checksum_gen->Finalize();
+
+          // Verify actual checksum and the func name
+          ASSERT_EQ(file_checksum_gen->Name(),
+                    output_file.file_checksum_func_name);
+          ASSERT_EQ(file_checksum_gen->GetChecksum(),
+                    output_file.file_checksum);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
 }
 
 TEST_F(CompactionServiceTest, CancelCompactionOnRemoteSide) {
@@ -403,6 +1087,41 @@ TEST_F(CompactionServiceTest, CancelCompactionOnRemoteSide) {
   VerifyTestData();
 }
 
+TEST_F(CompactionServiceTest, CancelCompactionOnPrimarySide) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  my_cs = GetCompactionService();
+
+  // Primary DB calls CancelAllBackgroundWork() while the compaction is running
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Inprogress",
+      [&](void* /*arg*/) { CancelAllBackgroundWork(db_, false /*wait*/); });
+
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_TRUE(s.IsIncomplete());
+
+  // Check canceled_ was set to true by CancelAwaitingJobs()
+  ASSERT_TRUE(my_cs->GetCanceled());
+
+  // compaction number is not increased
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num);
+}
+
 TEST_F(CompactionServiceTest, FailedToStart) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
@@ -437,6 +1156,8 @@ TEST_F(CompactionServiceTest, InvalidResult) {
   Slice end(end_str);
   Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
   ASSERT_FALSE(s.ok());
+  ASSERT_EQ(CompactionServiceJobStatus::kFailure,
+            my_cs->GetFinalCompactionServiceJobStatus());
 }
 
 TEST_F(CompactionServiceTest, SubCompaction) {
@@ -502,6 +1223,32 @@ TEST_F(CompactionServiceTest, CompactionFilter) {
   ASSERT_GE(my_cs->GetCompactionNum(), 1);
 }
 
+TEST_F(CompactionServiceTest, MergeOperator) {
+  Options options = CurrentOptions();
+  options.merge_operator.reset(new StringAppendOperator(','));
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  for (int i = 0; i < 200; i++) {
+    ASSERT_OK(db_->Merge(WriteOptions(), Key(i),
+                         "merge_op_append_" + std::to_string(i)));
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  // verify result
+  for (int i = 0; i < 200; i++) {
+    auto result = Get(Key(i));
+    if (i % 2) {
+      ASSERT_EQ(result, "value" + std::to_string(i) + ",merge_op_append_" +
+                            std::to_string(i));
+    } else {
+      ASSERT_EQ(result, "value_new" + std::to_string(i) + ",merge_op_append_" +
+                            std::to_string(i));
+    }
+  }
+  auto my_cs = GetCompactionService();
+  ASSERT_GE(my_cs->GetCompactionNum(), 1);
+}
+
 TEST_F(CompactionServiceTest, Snapshot) {
   Options options = CurrentOptions();
   ReopenWithCompactionService(&options);
@@ -521,6 +1268,81 @@ TEST_F(CompactionServiceTest, Snapshot) {
   ASSERT_EQ("value1", Get(Key(1), s1));
   ASSERT_EQ("value2", Get(Key(1)));
   db_->ReleaseSnapshot(s1);
+}
+
+TEST_F(CompactionServiceTest, PrecludeLastLevel) {
+  const int kNumTrigger = 4;
+  const int kNumLevels = 7;
+  const int kNumKeys = 100;
+
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.last_level_temperature = Temperature::kCold;
+  options.level0_file_num_compaction_trigger = 4;
+  options.max_subcompactions = 10;
+  options.num_levels = kNumLevels;
+
+  ReopenWithCompactionService(&options);
+  // Alternate for comparison: DestroyAndReopen(options);
+
+  // This is simpler than setting up mock time to make the user option work,
+  // but is not as direct as testing with preclude option itself.
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [&](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+      [&](void* arg) { *static_cast<SequenceNumber*>(arg) = 100; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  for (int i = 0; i < kNumTrigger; i++) {
+    for (int j = 0; j < kNumKeys; j++) {
+      ASSERT_OK(Put(Key(j * kNumTrigger + i), "v" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // Data split between proximal (kUnknown) and last (kCold) levels
+  ASSERT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
+  ASSERT_GT(GetSstSizeHelper(Temperature::kUnknown), 0);
+  ASSERT_GT(GetSstSizeHelper(Temperature::kCold), 0);
+
+  // TODO: Check FileSystem temperatures with FileTemperatureTestFS
+
+  for (int i = 0; i < kNumTrigger; i++) {
+    for (int j = 0; j < kNumKeys; j++) {
+      ASSERT_EQ(Get(Key(j * kNumTrigger + i)), "v" + std::to_string(i));
+    }
+  }
+
+  // Verify Output Stats
+  auto my_cs = GetCompactionService();
+  {
+    CompactionServiceResult result;
+    my_cs->GetResult(&result);
+    ASSERT_OK(result.status);
+    ASSERT_GT(result.internal_stats.output_level_stats.cpu_micros, 0);
+    ASSERT_GT(result.internal_stats.output_level_stats.micros, 0);
+    ASSERT_EQ(result.internal_stats.output_level_stats.num_output_records +
+                  result.internal_stats.proximal_level_stats.num_output_records,
+              kNumTrigger * kNumKeys);
+    ASSERT_EQ(result.internal_stats.output_level_stats.num_output_files +
+                  result.internal_stats.proximal_level_stats.num_output_files,
+              2);
+
+    CompactionServiceJobInfo info = my_cs->GetCompactionInfoForStart();
+    ASSERT_EQ(0, info.base_input_level);
+    ASSERT_EQ(kNumLevels - 1, info.output_level);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  // Disable Preclude feature and run full compaction to the bottommost level
+  {
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    CompactionServiceJobInfo info = my_cs->GetCompactionInfoForStart();
+    ASSERT_EQ(kNumLevels - 2, info.base_input_level);
+    ASSERT_EQ(kNumLevels - 1, info.output_level);
+  }
 }
 
 TEST_F(CompactionServiceTest, ConcurrentCompaction) {
@@ -586,11 +1408,25 @@ TEST_F(CompactionServiceTest, CompactionInfo) {
                               {file.db_path + "/" + file.name}, 2));
   info = my_cs->GetCompactionInfoForStart();
   ASSERT_EQ(Env::USER, info.priority);
+  ASSERT_EQ(CompactionReason::kManualCompaction, info.compaction_reason);
+  ASSERT_EQ(true, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
+  ASSERT_EQ(1, info.base_input_level);
+  ASSERT_EQ(2, info.output_level);
   info = my_cs->GetCompactionInfoForWait();
   ASSERT_EQ(Env::USER, info.priority);
+  ASSERT_EQ(CompactionReason::kManualCompaction, info.compaction_reason);
+  ASSERT_EQ(true, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
+  ASSERT_EQ(1, info.base_input_level);
+  ASSERT_EQ(2, info.output_level);
+  ASSERT_EQ(kDefaultColumnFamilyName, info.cf_name);
 
   // Test priority BOTTOM
   env_->SetBackgroundThreads(1, Env::BOTTOM);
+  // This will set bottommost_level = true but is_full_compaction = false
   options.num_levels = 2;
   ReopenWithCompactionService(&options);
   my_cs =
@@ -613,9 +1449,91 @@ TEST_F(CompactionServiceTest, CompactionInfo) {
   }
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   info = my_cs->GetCompactionInfoForStart();
+  ASSERT_EQ(CompactionReason::kLevelL0FilesNum, info.compaction_reason);
+  ASSERT_EQ(false, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
   ASSERT_EQ(Env::BOTTOM, info.priority);
+  ASSERT_EQ(0, info.base_input_level);
+  ASSERT_EQ(db_->NumberLevels() - 1, info.output_level);
   info = my_cs->GetCompactionInfoForWait();
   ASSERT_EQ(Env::BOTTOM, info.priority);
+  ASSERT_EQ(CompactionReason::kLevelL0FilesNum, info.compaction_reason);
+  ASSERT_EQ(false, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
+  ASSERT_EQ(0, info.base_input_level);
+  ASSERT_EQ(db_->NumberLevels() - 1, info.output_level);
+
+  // Test Non-Bottommost Level
+  options.num_levels = 4;
+  ReopenWithCompactionService(&options);
+  my_cs =
+      static_cast_with_check<MyTestCompactionService>(GetCompactionService());
+  int compaction_num = my_cs->GetCompactionNum();
+  ASSERT_EQ(0, compaction_num);
+
+  for (int i = 0; i < options.level0_file_num_compaction_trigger; i++) {
+    for (int j = 0; j < 10; j++) {
+      int key_id = i * 10 + j;
+      ASSERT_OK(Put(Key(key_id), "value_new_new" + std::to_string(key_id)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // This is trivial move. Done locally.
+  ASSERT_EQ(0, my_cs->GetCompactionNum());
+  info = my_cs->GetCompactionInfoForStart();
+  ASSERT_EQ(false, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(false, info.bottommost_level);
+  ASSERT_EQ(-1, info.base_input_level);
+  ASSERT_EQ(-1, info.output_level);
+  info = my_cs->GetCompactionInfoForWait();
+  ASSERT_EQ(false, info.is_manual_compaction);
+  ASSERT_EQ(false, info.is_full_compaction);
+  ASSERT_EQ(false, info.bottommost_level);
+  ASSERT_EQ(-1, info.base_input_level);
+  ASSERT_EQ(-1, info.output_level);
+
+  // Test Full Compaction + Bottommost Level
+  options.num_levels = 6;
+  ReopenWithCompactionService(&options);
+  my_cs =
+      static_cast_with_check<MyTestCompactionService>(GetCompactionService());
+
+  for (int i = 0; i < 20; i++) {
+    for (int j = 0; j < 10; j++) {
+      int key_id = i * 10 + j;
+      ASSERT_OK(Put(Key(key_id), "value_new_new" + std::to_string(key_id)));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(options.num_levels - 1);
+
+  // Force final level compaction
+  // base_input_level == output_level == last_level
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  info = my_cs->GetCompactionInfoForStart();
+  ASSERT_EQ(true, info.is_manual_compaction);
+  ASSERT_EQ(true, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
+  ASSERT_EQ(CompactionReason::kManualCompaction, info.compaction_reason);
+  info = my_cs->GetCompactionInfoForWait();
+  ASSERT_EQ(options.num_levels - 1, info.base_input_level);
+  ASSERT_EQ(options.num_levels - 1, info.output_level);
+  ASSERT_EQ(true, info.is_manual_compaction);
+  ASSERT_EQ(true, info.is_full_compaction);
+  ASSERT_EQ(true, info.bottommost_level);
+  ASSERT_EQ(CompactionReason::kManualCompaction, info.compaction_reason);
+  ASSERT_EQ(options.num_levels - 1, info.base_input_level);
+  ASSERT_EQ(options.num_levels - 1, info.output_level);
+  ASSERT_EQ("0,0,0,0,0,1", FilesPerLevel());
 }
 
 TEST_F(CompactionServiceTest, FallbackLocalAuto) {
@@ -703,6 +1621,40 @@ TEST_F(CompactionServiceTest, FallbackLocalManual) {
 
   // verify result after 2 manual compactions
   VerifyTestData();
+}
+
+TEST_F(CompactionServiceTest, AbortedWhileWait) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+  VerifyTestData();
+
+  auto my_cs = GetCompactionService();
+  Statistics* compactor_statistics = GetCompactorStatistics();
+  Statistics* primary_statistics = GetPrimaryStatistics();
+
+  my_cs->ResetOverride();
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+
+  // Override Wait() result with kAborted
+  my_cs->OverrideWaitStatus(CompactionServiceJobStatus::kAborted);
+  start_str = Key(120);
+  start = start_str;
+
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, nullptr);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsAborted());
+  // no remote compaction is run
+  ASSERT_EQ(my_cs->GetCompactionNum(), 0);
+  // make sure the compaction statistics is not recorded any side
+  ASSERT_EQ(primary_statistics->getTickerCount(COMPACT_WRITE_BYTES), 0);
+  ASSERT_EQ(primary_statistics->getTickerCount(REMOTE_COMPACT_WRITE_BYTES), 0);
+  ASSERT_EQ(compactor_statistics->getTickerCount(COMPACT_WRITE_BYTES), 0);
 }
 
 TEST_F(CompactionServiceTest, RemoteEventListener) {

@@ -59,7 +59,7 @@ fi
 if ! test $ROCKSDB_DISABLE_ZSTD; then
   ZSTD_INCLUDE=" -I $ZSTD_BASE/include/"
   ZSTD_LIBS=" $ZSTD_BASE/lib/libzstd${MAYBE_PIC}.a"
-  CFLAGS+=" -DZSTD"
+  CFLAGS+=" -DZSTD -DZSTD_STATIC_LINKING_ONLY"
 fi
 
 # location of gflags headers and libraries
@@ -110,7 +110,7 @@ CLANG_LIB="$CLANG_BASE/lib"
 CLANG_SRC="$CLANG_BASE/../../src"
 
 CLANG_ANALYZER="$CLANG_BIN/clang++"
-CLANG_SCAN_BUILD="$CLANG_SRC/llvm/clang/tools/scan-build/bin/scan-build"
+CLANG_SCAN_BUILD="$CLANG_BIN/scan-build"
 
 if [ -z "$USE_CLANG" ]; then
   # gcc

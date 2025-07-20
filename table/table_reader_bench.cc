@@ -100,11 +100,11 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
     int unknown_level = -1;
     const WriteOptions write_options;
     tb = opts.table_factory->NewTableBuilder(
-        TableBuilderOptions(ioptions, moptions, read_options, write_options,
-                            ikc, &internal_tbl_prop_coll_factories,
-                            CompressionType::kNoCompression,
-                            CompressionOptions(), 0 /* column_family_id */,
-                            kDefaultColumnFamilyName, unknown_level),
+        TableBuilderOptions(
+            ioptions, moptions, read_options, write_options, ikc,
+            &internal_tbl_prop_coll_factories, CompressionType::kNoCompression,
+            CompressionOptions(), 0 /* column_family_id */,
+            kDefaultColumnFamilyName, unknown_level, kUnknownNewestKeyTime),
         file_writer.get());
   } else {
     s = DB::Open(opts, dbname, &db);
@@ -145,8 +145,9 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
     std::unique_ptr<RandomAccessFileReader> file_reader(
         new RandomAccessFileReader(std::move(raf), file_name));
     s = opts.table_factory->NewTableReader(
-        TableReaderOptions(ioptions, moptions.prefix_extractor, env_options,
-                           ikc, 0 /* block_protection_bytes_per_key */),
+        TableReaderOptions(ioptions, moptions.prefix_extractor,
+                           moptions.compression_manager.get(), env_options, ikc,
+                           0 /* block_protection_bytes_per_key */),
         std::move(file_reader), file_size, &table_reader);
     if (!s.ok()) {
       fprintf(stderr, "Open Table Error: %s\n", s.ToString().c_str());

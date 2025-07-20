@@ -7,8 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "rocksdb/options.h"
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -25,6 +23,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/write_batch.h"
@@ -864,7 +863,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksOnCompact) {
     ASSERT_OK(DB::Open(options, dbname_, &db_));
     assert(db_ != nullptr);  // suppress false clang-analyze report
     Build(100, 2);
-    // ASSERT_OK(db_->Flush(FlushOptions()));
     DBImpl* dbi = static_cast_with_check<DBImpl>(db_);
     ASSERT_OK(dbi->TEST_FlushMemTable());
     mock->SetCorruptionMode(mode);

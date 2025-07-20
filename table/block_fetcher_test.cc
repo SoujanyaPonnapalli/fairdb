@@ -83,7 +83,8 @@ class BlockFetcherTest : public testing::Test {
         TableBuilderOptions(ioptions, moptions, read_options, write_options,
                             comparator, &factories, compression_type,
                             CompressionOptions(), 0 /* column_family_id */,
-                            kDefaultColumnFamilyName, -1 /* level */),
+                            kDefaultColumnFamilyName, -1 /* level */,
+                            kUnknownNewestKeyTime),
         writer.get()));
 
     // Build table.
@@ -318,10 +319,12 @@ class BlockFetcherTest : public testing::Test {
     PersistentCacheOptions persistent_cache_options;
     Footer footer;
     ReadFooter(file, &footer);
+    auto mgr = GetBuiltinCompressionManager(
+        GetCompressFormatForVersion(footer.format_version()));
     std::unique_ptr<BlockFetcher> fetcher(new BlockFetcher(
         file, nullptr /* prefetch_buffer */, footer, roptions, block, contents,
         ioptions, do_uncompress, compressed, block_type,
-        UncompressionDict::GetEmptyDict(), persistent_cache_options,
+        mgr->GetDecompressor().get(), persistent_cache_options,
         heap_buf_allocator, compressed_buf_allocator));
 
     ASSERT_OK(fetcher->ReadBlockContents());
@@ -334,7 +337,7 @@ class BlockFetcherTest : public testing::Test {
     if (do_uncompress) {
       *compression_type = kNoCompression;
     } else {
-      *compression_type = fetcher->get_compression_type();
+      *compression_type = fetcher->compression_type();
     }
   }
 
@@ -528,7 +531,6 @@ TEST_F(BlockFetcherTest, FetchAndUncompressCompressedDataBlock) {
   TestFetchDataBlock("FetchAndUncompressCompressedDataBlock", true, true,
                      expected_stats_by_mode);
 }
-
 
 }  // namespace
 }  // namespace ROCKSDB_NAMESPACE

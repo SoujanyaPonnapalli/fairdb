@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 #include <vector>
 
@@ -53,7 +52,8 @@ class LogReaderContainer {
     Logger* info_log;
     std::string fname;
     Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
-    void Corruption(size_t bytes, const Status& s) override {
+    void Corruption(size_t bytes, const Status& s,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",
                      (this->status == nullptr ? "(ignoring error) " : ""),
                      fname.c_str(), static_cast<int>(bytes),
@@ -82,8 +82,9 @@ class DBImplSecondary : public DBImpl {
   // and log_readers_ to facilitate future operations.
   Status Recover(const std::vector<ColumnFamilyDescriptor>& column_families,
                  bool read_only, bool error_if_wal_file_exists,
-                 bool error_if_data_exists_in_wals, uint64_t* = nullptr,
-                 RecoveryContext* recovery_ctx = nullptr) override;
+                 bool error_if_data_exists_in_wals, bool is_retry = false,
+                 uint64_t* = nullptr, RecoveryContext* recovery_ctx = nullptr,
+                 bool* can_retry = nullptr) override;
 
   // Can return IOError due to files being deleted by the primary. To avoid
   // IOError in this case, application can coordinate between primary and
@@ -276,6 +277,10 @@ class DBImplSecondary : public DBImpl {
     return false;
   }
 
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader_;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter_;
+  std::unique_ptr<Status> manifest_reader_status_;
+
  private:
   friend class DB;
 
@@ -303,10 +308,6 @@ class DBImplSecondary : public DBImpl {
                                     ColumnFamilyHandle* cfh,
                                     const CompactionServiceInput& input,
                                     CompactionServiceResult* result);
-
-  std::unique_ptr<log::FragmentBufferedReader> manifest_reader_;
-  std::unique_ptr<log::Reader::Reporter> manifest_reporter_;
-  std::unique_ptr<Status> manifest_reader_status_;
 
   // Cache log readers for each log number, used for continue WAL replay
   // after recovery

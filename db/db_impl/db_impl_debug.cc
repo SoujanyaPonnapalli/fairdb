@@ -6,9 +6,10 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-
 #ifndef NDEBUG
+#include <iostream>
 
+#include "db/blob/blob_file_cache.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -83,6 +84,7 @@ void DBImpl::TEST_GetFilesMetaData(
 }
 
 uint64_t DBImpl::TEST_Current_Manifest_FileNo() {
+  InstrumentedMutexLock l(&mutex_);
   return versions_->manifest_file_number();
 }
 
@@ -102,8 +104,8 @@ Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
     cfd = cfh->cfd();
   }
   int output_level =
-      (cfd->ioptions()->compaction_style == kCompactionStyleUniversal ||
-       cfd->ioptions()->compaction_style == kCompactionStyleFIFO)
+      (cfd->ioptions().compaction_style == kCompactionStyleUniversal ||
+       cfd->ioptions().compaction_style == kCompactionStyleFIFO)
           ? level
           : level + 1;
   return RunManualCompaction(
@@ -199,6 +201,11 @@ Status DBImpl::TEST_GetBGError() {
   return error_handler_.GetBGError();
 }
 
+bool DBImpl::TEST_IsRecoveryInProgress() {
+  InstrumentedMutexLock l(&mutex_);
+  return error_handler_.IsRecoveryInProgress();
+}
+
 void DBImpl::TEST_LockMutex() { mutex_.Lock(); }
 
 void DBImpl::TEST_UnlockMutex() { mutex_.Unlock(); }
@@ -218,32 +225,25 @@ void DBImpl::TEST_EndWrite(void* w) {
 }
 
 size_t DBImpl::TEST_LogsToFreeSize() {
-  InstrumentedMutexLock l(&log_write_mutex_);
-  return logs_to_free_.size();
+  InstrumentedMutexLock l(&wal_write_mutex_);
+  return wals_to_free_.size();
 }
 
 uint64_t DBImpl::TEST_LogfileNumber() {
   InstrumentedMutexLock l(&mutex_);
-  return logfile_number_;
+  return cur_wal_number_;
 }
 
-Status DBImpl::TEST_GetAllImmutableCFOptions(
-    std::unordered_map<std::string, const ImmutableCFOptions*>* iopts_map) {
-  std::vector<std::string> cf_names;
-  std::vector<const ImmutableCFOptions*> iopts;
-  {
-    InstrumentedMutexLock l(&mutex_);
-    for (auto cfd : *versions_->GetColumnFamilySet()) {
-      cf_names.push_back(cfd->GetName());
-      iopts.push_back(cfd->ioptions());
+void DBImpl::TEST_GetAllBlockCaches(
+    std::unordered_set<const Cache*>* cache_set) {
+  InstrumentedMutexLock l(&mutex_);
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (const auto bbto =
+            cfd->GetCurrentMutableCFOptions()
+                .table_factory->GetOptions<BlockBasedTableOptions>()) {
+      cache_set->insert(bbto->block_cache.get());
     }
   }
-  iopts_map->clear();
-  for (size_t i = 0; i < cf_names.size(); ++i) {
-    iopts_map->insert({cf_names[i], iopts[i]});
-  }
-
-  return Status::OK();
 }
 
 uint64_t DBImpl::TEST_FindMinLogContainingOutstandingPrep() {
@@ -259,7 +259,7 @@ size_t DBImpl::TEST_LogsWithPrepSize() {
 }
 
 uint64_t DBImpl::TEST_FindMinPrepLogReferencedByMemTable() {
-  autovector<MemTable*> empty_list;
+  autovector<ReadOnlyMemTable*> empty_list;
   return FindMinPrepLogReferencedByMemTable(versions_.get(), empty_list);
 }
 
@@ -268,7 +268,7 @@ Status DBImpl::TEST_GetLatestMutableCFOptions(
   InstrumentedMutexLock l(&mutex_);
 
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
-  *mutable_cf_options = *cfh->cfd()->GetLatestMutableCFOptions();
+  *mutable_cf_options = cfh->cfd()->GetLatestMutableCFOptions();
   return Status::OK();
 }
 
@@ -314,9 +314,82 @@ const autovector<uint64_t>& DBImpl::TEST_GetFilesToQuarantine() const {
   return error_handler_.GetFilesToQuarantine();
 }
 
+void DBImpl::TEST_DeleteObsoleteFiles() {
+  InstrumentedMutexLock l(&mutex_);
+  DeleteObsoleteFiles();
+}
+
 size_t DBImpl::TEST_EstimateInMemoryStatsHistorySize() const {
   InstrumentedMutexLock l(&const_cast<DBImpl*>(this)->stats_history_mutex_);
   return EstimateInMemoryStatsHistorySize();
+}
+
+void DBImpl::TEST_VerifyNoObsoleteFilesCached(
+    bool db_mutex_already_held) const {
+  // This check is somewhat expensive and obscure to make a part of every
+  // unit test in every build variety. Thus, we only enable it for ASAN builds.
+  if (!kMustFreeHeapAllocations) {
+    return;
+  }
+
+  std::optional<InstrumentedMutexLock> l;
+  if (db_mutex_already_held) {
+    mutex_.AssertHeld();
+  } else {
+    l.emplace(&mutex_);
+  }
+
+  if (!opened_successfully_) {
+    // We don't need to pro-actively clean up open files during DB::Open()
+    // if we know we are about to fail and clean up in Close().
+    return;
+  }
+  if (disable_delete_obsolete_files_ > 0) {
+    // For better or worse, DB::Close() is allowed with deletions disabled.
+    // Since we generally associate clean-up of open files with deleting them,
+    // we allow "obsolete" open files when deletions are disabled.
+    return;
+  }
+
+  // Live and "quarantined" files are allowed to be open in table cache
+  std::set<uint64_t> live_and_quar_files;
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    // Iterate over live versions
+    Version* current = cfd->current();
+    Version* ver = current;
+    do {
+      // Sneakily add both SST and blob files to the same list
+      std::vector<uint64_t> live_files_vec;
+      ver->AddLiveFiles(&live_files_vec, &live_files_vec);
+      live_and_quar_files.insert(live_files_vec.begin(), live_files_vec.end());
+
+      ver = ver->Next();
+    } while (ver != current);
+  }
+  {
+    const auto& quar_files = error_handler_.GetFilesToQuarantine();
+    live_and_quar_files.insert(quar_files.begin(), quar_files.end());
+  }
+  auto fn = [&live_and_quar_files](const Slice& key, Cache::ObjectPtr, size_t,
+                                   const Cache::CacheItemHelper*) {
+    // See TableCache and BlobFileCache
+    assert(key.size() == sizeof(uint64_t));
+    uint64_t file_number;
+    GetUnaligned(reinterpret_cast<const uint64_t*>(key.data()), &file_number);
+    // Assert file is in live/quarantined set
+    bool cached_file_is_live_or_quar =
+        live_and_quar_files.find(file_number) != live_and_quar_files.end();
+    if (!cached_file_is_live_or_quar) {
+      // Fail with useful info
+      std::cerr << "File " << file_number << " is not live nor quarantined"
+                << std::endl;
+      assert(cached_file_is_live_or_quar);
+    }
+  };
+  table_cache_->ApplyToAllEntries(fn, {});
 }
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // NDEBUG

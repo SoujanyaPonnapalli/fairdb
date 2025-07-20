@@ -213,9 +213,8 @@ void LRUHandleTable::Resize() {
 
   uint32_t old_length = uint32_t{1} << length_bits_;
   int new_length_bits = length_bits_ + 1;
-  std::unique_ptr<LRUHandle* []> new_list {
-    new LRUHandle* [size_t{1} << new_length_bits] {}
-  };
+  std::unique_ptr<LRUHandle*[]> new_list{
+      new LRUHandle* [size_t{1} << new_length_bits] {}};
   [[maybe_unused]] uint32_t count = 0;
   for (uint32_t i = 0; i < old_length; i++) {
     LRUHandle* h = list_[i];
@@ -851,6 +850,17 @@ const Cache::CacheItemHelper* LRUCache::GetCacheItemHelper(
     Handle* handle) const {
   auto h = static_cast<const LRUHandle*>(handle);
   return h->helper;
+}
+
+void LRUCache::ApplyToHandle(
+    Cache* cache, Handle* handle,
+    const std::function<void(const Slice& key, ObjectPtr value, size_t charge,
+                             const CacheItemHelper* helper)>& callback) {
+  auto cache_ptr = static_cast<LRUCache*>(cache);
+  auto h = static_cast<const LRUHandle*>(handle);
+  callback(h->key(), h->value,
+           h->GetCharge(cache_ptr->GetShard(0).metadata_charge_policy_),
+           h->helper);
 }
 
 size_t LRUCache::TEST_GetLRUSize() {

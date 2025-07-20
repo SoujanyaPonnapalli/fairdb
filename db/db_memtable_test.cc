@@ -313,6 +313,10 @@ TEST_F(DBMemTableTest, InsertWithHint) {
   ASSERT_EQ("foo_v3", Get("foo_k3"));
   ASSERT_EQ("bar_v1", Get("bar_k1"));
   ASSERT_EQ("bar_v2", Get("bar_k2"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), "foo_k1", "foo_k4"));
+  ASSERT_EQ(hint_bar, rep->last_hint_in());
+  ASSERT_EQ(hint_bar, rep->last_hint_out());
+  ASSERT_EQ(5, rep->num_insert_with_hint());
   ASSERT_EQ("vvv", Get("NotInPrefixDomain"));
 }
 
@@ -335,6 +339,181 @@ TEST_F(DBMemTableTest, ColumnFamilyId) {
   }
 }
 
+TEST_F(DBMemTableTest, IntegrityChecks) {
+  // We insert keys key000000, key000001 and key000002 into skiplist at fixed
+  // height 1 (smallest height). Then we corrupt the second key to aey000001 to
+  // make it smaller. With `paranoid_memory_checks` set to true, if the
+  // skip list sees key000000 and then aey000001, then it will report out of
+  // order keys with corruption status. With `paranoid_memory_checks` set
+  // to false, read/scan may return wrong results.
+  for (bool allow_data_in_error : {false, true}) {
+    Options options = CurrentOptions();
+    options.allow_data_in_errors = allow_data_in_error;
+    options.paranoid_memory_checks = true;
+    DestroyAndReopen(options);
+    SyncPoint::GetInstance()->SetCallBack(
+        "InlineSkipList::RandomHeight::height", [](void* h) {
+          auto height_ptr = static_cast<int*>(h);
+          *height_ptr = 1;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(Put(Key(0), "val0"));
+    ASSERT_OK(Put(Key(2), "val2"));
+    // p will point to the buffer for encoded key000001
+    char* p = nullptr;
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::Add:BeforeReturn:Encoded", [&](void* encoded) {
+          p = const_cast<char*>(static_cast<Slice*>(encoded)->data());
+        });
+    ASSERT_OK(Put(Key(1), "val1"));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_TRUE(p);
+    // Offset 0 is key size, key bytes start at offset 1.
+    // "key000001 -> aey000001"
+    p[1] = 'a';
+
+    ReadOptions rops;
+    std::string val;
+    Status s = db_->Get(rops, Key(1), &val);
+    ASSERT_TRUE(s.IsCorruption());
+    std::string key0 = Slice(Key(0)).ToString(true);
+    ASSERT_EQ(s.ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+    // Without `paranoid_memory_checks`, NotFound will be returned.
+    // This would fail an assertion in InlineSkipList::FindGreaterOrEqual().
+    // If we remove the assertion, this passes.
+    // ASSERT_TRUE(db_->Get(ReadOptions(), Key(1), &val).IsNotFound());
+
+    std::vector<std::string> vals;
+    std::vector<Status> statuses = db_->MultiGet(
+        rops, {db_->DefaultColumnFamily()}, {Key(1)}, &vals, nullptr);
+    ASSERT_TRUE(statuses[0].IsCorruption());
+    ASSERT_EQ(statuses[0].ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+
+    std::unique_ptr<Iterator> iter{db_->NewIterator(rops)};
+    ASSERT_OK(iter->status());
+    iter->Seek(Key(1));
+    ASSERT_TRUE(iter->status().IsCorruption());
+    ASSERT_EQ(iter->status().ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+
+    iter->Seek(Key(0));
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    // iterating through skip list at height at 1 should catch out-of-order keys
+    iter->Next();
+    ASSERT_TRUE(iter->status().IsCorruption());
+    ASSERT_EQ(iter->status().ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+    ASSERT_FALSE(iter->Valid());
+
+    iter->SeekForPrev(Key(2));
+    ASSERT_TRUE(iter->status().IsCorruption());
+    ASSERT_EQ(iter->status().ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+
+    // Internally DB Iter will iterate backwards (call Prev()) after
+    // SeekToLast() to find the correct internal key with the last user key.
+    // Prev() will do integrity checks and catch corruption.
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->status().IsCorruption());
+    ASSERT_EQ(iter->status().ToString().find(key0) != std::string::npos,
+              allow_data_in_error);
+    ASSERT_FALSE(iter->Valid());
+  }
+}
+
+TEST_F(DBMemTableTest, VectorConcurrentInsert) {
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.allow_concurrent_memtable_write = true;
+  options.memtable_factory.reset(new VectorRepFactory());
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"cf1"}, options);
+
+  // Multi-threaded writes
+  {
+    WriteOptions write_options;
+    std::vector<port::Thread> threads;
+    for (int i = 0; i < 10; ++i) {
+      threads.emplace_back([&, i]() {
+        int start = i * 100;
+        int end = start + 100;
+        WriteBatch batch;
+        for (int j = start; j < end; ++j) {
+          ASSERT_OK(
+              batch.Put(handles_[0], Key(j), "value" + std::to_string(j)));
+        }
+        ASSERT_OK(db_->Write(write_options, &batch));
+      });
+    }
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    std::unique_ptr<Iterator> iter(
+        db_->NewIterator(ReadOptions(), handles_[0]));
+    iter->SeekToFirst();
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), Key(i));
+      ASSERT_EQ(iter->value().ToString(), "value" + std::to_string(i));
+      iter->Next();
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+
+  // Multi-threaded writes, multi CF
+  {
+    WriteOptions write_options;
+    std::vector<port::Thread> threads;
+    for (int i = 0; i < 10; ++i) {
+      threads.emplace_back([&, i]() {
+        int start = i * 100;
+        int end = start + 100;
+        WriteBatch batch;
+        for (int j = start; j < end; ++j) {
+          ASSERT_OK(batch.Put(handles_[0], Key(j), "CF0" + std::to_string(j)));
+          ASSERT_OK(batch.Put(handles_[1], Key(j), "CF1" + std::to_string(j)));
+        }
+        ASSERT_OK(db_->Write(write_options, &batch));
+      });
+    }
+
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    std::unique_ptr<Iterator> iter0(
+        db_->NewIterator(ReadOptions(), handles_[0]));
+    std::unique_ptr<Iterator> iter1(
+        db_->NewIterator(ReadOptions(), handles_[1]));
+    iter0->SeekToFirst();
+    iter1->SeekToFirst();
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_TRUE(iter0->Valid());
+      ASSERT_EQ(iter0->key().ToString(), Key(i));
+      ASSERT_EQ(iter0->value().ToString(), "CF0" + std::to_string(i));
+      iter0->Next();
+
+      ASSERT_TRUE(iter1->Valid());
+      ASSERT_EQ(iter1->key().ToString(), Key(i));
+      ASSERT_EQ(iter1->value().ToString(), "CF1" + std::to_string(i));
+      iter1->Next();
+    }
+    ASSERT_FALSE(iter0->Valid());
+    ASSERT_OK(iter0->status());
+    ASSERT_FALSE(iter1->Valid());
+    ASSERT_OK(iter1->status());
+  }
+
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

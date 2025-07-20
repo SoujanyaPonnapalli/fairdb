@@ -14,6 +14,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/file_system.h"
 #include "test_util/sync_point.h"
+#include "util/defer.h"
 #include "util/udt_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -270,8 +271,10 @@ TEST_F(DBWALTest, SyncWALNotWaitWrite) {
   ASSERT_OK(Put("foo3", "bar3"));
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
-      {"SpecialEnv::WalFile::Append:1", "DBWALTest::SyncWALNotWaitWrite:1"},
-      {"DBWALTest::SyncWALNotWaitWrite:2", "SpecialEnv::WalFile::Append:2"},
+      {"SpecialEnv::SpecialWalFile::Append:1",
+       "DBWALTest::SyncWALNotWaitWrite:1"},
+      {"DBWALTest::SyncWALNotWaitWrite:2",
+       "SpecialEnv::SpecialWalFile::Append:2"},
   });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -814,6 +817,7 @@ TEST_F(DBWALTest, WALWithChecksumHandoff) {
     writeOpt.disableWAL = false;
     // Data is persisted in the WAL
     ASSERT_OK(dbfull()->Put(writeOpt, handles_[1], "zoo", "v3"));
+    ASSERT_OK(dbfull()->SyncWAL());
     // The hash does not match, write fails
     fault_fs->SetChecksumHandoffFuncType(ChecksumType::kxxHash);
     writeOpt.disableWAL = false;
@@ -1123,15 +1127,13 @@ TEST_F(DBWALTest, PreallocateBlock) {
 }
 #endif  // !(defined NDEBUG) || !defined(OS_WIN)
 
-TEST_F(DBWALTest, DISABLED_FullPurgePreservesRecycledLog) {
-  // TODO(ajkr): Disabled until WAL recycling is fixed for
-  // `kPointInTimeRecovery`.
-
+TEST_F(DBWALTest, FullPurgePreservesRecycledLog) {
   // For github issue #1303
   for (int i = 0; i < 2; ++i) {
     Options options = CurrentOptions();
     options.create_if_missing = true;
     options.recycle_log_file_num = 2;
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
     if (i != 0) {
       options.wal_dir = alternative_wal_dir_;
     }
@@ -1151,6 +1153,7 @@ TEST_F(DBWALTest, DISABLED_FullPurgePreservesRecycledLog) {
     dbfull()->FindObsoleteFiles(&job_context, true /* force */);
     dbfull()->TEST_UnlockMutex();
     dbfull()->PurgeObsoleteFiles(job_context);
+    job_context.Clean();
 
     if (i == 0) {
       ASSERT_OK(
@@ -1162,16 +1165,14 @@ TEST_F(DBWALTest, DISABLED_FullPurgePreservesRecycledLog) {
   }
 }
 
-TEST_F(DBWALTest, DISABLED_FullPurgePreservesLogPendingReuse) {
-  // TODO(ajkr): Disabled until WAL recycling is fixed for
-  // `kPointInTimeRecovery`.
-
+TEST_F(DBWALTest, FullPurgePreservesLogPendingReuse) {
   // Ensures full purge cannot delete a WAL while it's in the process of being
   // recycled. In particular, we force the full purge after a file has been
   // chosen for reuse, but before it has been renamed.
   for (int i = 0; i < 2; ++i) {
     Options options = CurrentOptions();
     options.recycle_log_file_num = 1;
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
     if (i != 0) {
       options.wal_dir = alternative_wal_dir_;
     }
@@ -1472,6 +1473,213 @@ TEST_F(DBWALTest, SyncMultipleLogs) {
   ASSERT_OK(dbfull()->SyncWAL());
 }
 
+TEST_F(DBWALTest, DISABLED_RecycleMultipleWalsCrash) {
+  Options options = CurrentOptions();
+  options.max_write_buffer_number = 5;
+  options.track_and_verify_wals_in_manifest = true;
+  options.max_bgerror_resume_count = 0;  // manual resume
+  options.recycle_log_file_num = 3;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+
+  // Disable truncating recycled WALs to new size in posix env
+  // (approximating a crash)
+  SyncPoint::GetInstance()->SetCallBack(
+      "PosixWritableFile::Close",
+      [](void* arg) { *(static_cast<size_t*>(arg)) = 0; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Re-open with desired options
+  DestroyAndReopen(options);
+  Defer closer([this]() { Close(); });
+
+  // Ensure WAL recycling wasn't sanitized away
+  ASSERT_EQ(db_->GetOptions().recycle_log_file_num,
+            options.recycle_log_file_num);
+
+  // Prepare external files for later ingestion
+  std::string sst_files_dir = dbname_ + "/sst_files/";
+  ASSERT_OK(DestroyDir(env_, sst_files_dir));
+  ASSERT_OK(env_->CreateDir(sst_files_dir));
+  std::string external_file1 = sst_files_dir + "file1.sst";
+  {
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    ASSERT_OK(sst_file_writer.Open(external_file1));
+    ASSERT_OK(sst_file_writer.Put("external1", "ex1"));
+    ExternalSstFileInfo file_info;
+    ASSERT_OK(sst_file_writer.Finish(&file_info));
+  }
+  std::string external_file2 = sst_files_dir + "file2.sst";
+  {
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    ASSERT_OK(sst_file_writer.Open(external_file2));
+    ASSERT_OK(sst_file_writer.Put("external2", "ex2"));
+    ExternalSstFileInfo file_info;
+    ASSERT_OK(sst_file_writer.Finish(&file_info));
+  }
+
+  // Populate some WALs to be recycled such that there will be extra data
+  // from an old incarnation of the WAL on recovery
+  ASSERT_OK(db_->PauseBackgroundWork());
+  ASSERT_OK(Put("ignore1", Random::GetTLSInstance()->RandomString(500)));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(Put("ignore2", Random::GetTLSInstance()->RandomString(500)));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(db_->ContinueBackgroundWork());
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("ignore3", Random::GetTLSInstance()->RandomString(500)));
+  ASSERT_OK(Flush());
+
+  // Verify expected log files (still there for recycling)
+  std::vector<FileAttributes> files;
+  int log_count = 0;
+  ASSERT_OK(options.env->GetChildrenFileAttributes(dbname_, &files));
+  for (const auto& f : files) {
+    if (EndsWith(f.name, ".log")) {
+      EXPECT_GT(f.size_bytes, 500);
+      ++log_count;
+    }
+  }
+  EXPECT_EQ(log_count, 3);
+
+  // (Re-used recipe) Generate two inactive WALs and one active WAL, with a
+  // gap in sequence numbers to interfere with recovery
+  ASSERT_OK(db_->PauseBackgroundWork());
+  ASSERT_OK(Put("key1", "val1"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key2", "val2"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  // Need a gap in sequence numbers, so e.g. ingest external file
+  // with an open snapshot
+  {
+    ManagedSnapshot snapshot(db_);
+    ASSERT_OK(
+        db_->IngestExternalFile({external_file1}, IngestExternalFileOptions()));
+  }
+  ASSERT_OK(Put("key3", "val3"));
+  ASSERT_OK(db_->SyncWAL());
+  // Need an SST file that is logically after that WAL, so that dropping WAL
+  // data is not a valid point in time.
+  {
+    ManagedSnapshot snapshot(db_);
+    ASSERT_OK(
+        db_->IngestExternalFile({external_file2}, IngestExternalFileOptions()));
+  }
+
+  // Approximate a crash, with respect to recycled WAL data extending past
+  // the end of the current WAL data (see SyncPoint callback above)
+  Close();
+
+  // Verify recycled log files haven't been truncated
+  files.clear();
+  log_count = 0;
+  ASSERT_OK(options.env->GetChildrenFileAttributes(dbname_, &files));
+  for (const auto& f : files) {
+    if (EndsWith(f.name, ".log")) {
+      EXPECT_GT(f.size_bytes, 500);
+      ++log_count;
+    }
+  }
+  EXPECT_EQ(log_count, 3);
+
+  // Verify no data loss after reopen.
+  Reopen(options);
+  EXPECT_EQ("val1", Get("key1"));
+  EXPECT_EQ("val2", Get("key2"));  // Passes because of adjacent seqnos
+  EXPECT_EQ("ex1", Get("external1"));
+  EXPECT_EQ("val3", Get("key3"));  // <- ONLY FAILURE! (Not a point in time)
+  EXPECT_EQ("ex2", Get("external2"));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBWALTest, SyncWalPartialFailure) {
+  class MyTestFileSystem : public FileSystemWrapper {
+   public:
+    explicit MyTestFileSystem(std::shared_ptr<FileSystem> base)
+        : FileSystemWrapper(std::move(base)) {}
+
+    static const char* kClassName() { return "MyTestFileSystem"; }
+    const char* Name() const override { return kClassName(); }
+    IOStatus NewWritableFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSWritableFile>* result,
+                             IODebugContext* dbg) override {
+      IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+      if (s.ok()) {
+        *result =
+            std::make_unique<MyTestWritableFile>(std::move(*result), *this);
+      }
+      return s;
+    }
+
+    AcqRelAtomic<uint32_t> syncs_before_failure_{UINT32_MAX};
+
+   protected:
+    class MyTestWritableFile : public FSWritableFileOwnerWrapper {
+     public:
+      MyTestWritableFile(std::unique_ptr<FSWritableFile>&& file,
+                         MyTestFileSystem& fs)
+          : FSWritableFileOwnerWrapper(std::move(file)), fs_(fs) {}
+
+      IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
+        int prev_val = fs_.syncs_before_failure_.FetchSub(1);
+        if (prev_val == 0) {
+          return IOStatus::IOError("fault");
+        } else {
+          return target()->Sync(options, dbg);
+        }
+      }
+
+     protected:
+      MyTestFileSystem& fs_;
+    };
+  };
+
+  Options options = CurrentOptions();
+  options.max_write_buffer_number = 4;
+  options.track_and_verify_wals_in_manifest = true;
+  options.max_bgerror_resume_count = 0;  // manual resume
+
+  auto custom_fs =
+      std::make_shared<MyTestFileSystem>(options.env->GetFileSystem());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(custom_fs));
+  options.env = fault_fs_env.get();
+  Reopen(options);
+  Defer closer([this]() { Close(); });
+
+  // This is the simplest way to get
+  // * one inactive WAL, synced
+  // * one inactive WAL, not synced, and
+  // * one active WAL, not synced
+  // with a single thread, to exercise as much logic as we reasonably can.
+  ASSERT_OK(db_->PauseBackgroundWork());
+  ASSERT_OK(Put("key1", "val1"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_OK(Put("key2", "val2"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key3", "val3"));
+
+  // Allow 1 of the WALs to sync, but another won't
+  custom_fs->syncs_before_failure_.Store(1);
+  ASSERT_NOK(db_->SyncWAL());
+
+  // Stuck in this state. (This could previously cause a segfault.)
+  ASSERT_NOK(db_->SyncWAL());
+
+  // Can't Resume because WAL write failure is considered non-recoverable,
+  // regardless of the IOStatus itself. (Can/should be fixed?)
+  ASSERT_NOK(db_->Resume());
+
+  // Verify no data loss after reopen.
+  // Also Close() could previously crash in this state.
+  Reopen(options);
+  ASSERT_EQ("val1", Get("key1"));
+  ASSERT_EQ("val2", Get("key2"));
+  ASSERT_EQ("val3", Get("key3"));
+}
+
 // Github issue 1339. Prior the fix we read sequence id from the first log to
 // a local variable, then keep increase the variable as we replay logs,
 // ignoring actual sequence id of the records. This is incorrect if some writes
@@ -1631,9 +1839,194 @@ class RecoveryTestHelper {
   }
 };
 
-class DBWALTestWithParams : public DBWALTestBase,
-                            public ::testing::WithParamInterface<
-                                std::tuple<bool, int, int, CompressionType>> {
+TEST_F(DBWALTest, TrackAndVerifyWALsRecycleWAL) {
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.recycle_log_file_num = 1;
+  options.track_and_verify_wals = true;
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key_ignore", "wal_to_recycle"));
+  ASSERT_OK(Put("key_ignore1", "wal_to_recycle"));
+  ASSERT_OK(Put("key_ignore2", "wal_to_recycle"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("key_ignore", "wal_to_recycle"));
+  ASSERT_OK(Put("key_ignore1", "wal_to_recycle"));
+  ASSERT_OK(Put("key_ignore2", "wal_to_recycle"));
+  ASSERT_OK(Flush());
+
+  // Stop background flush to avoid deleting any WAL
+  options.env->SetBackgroundThreads(1, Env::HIGH);
+  test::SleepingBackgroundTask sleeping_task;
+  options.env->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                        &sleeping_task, Env::Priority::HIGH);
+
+  // Recycle the first WAL
+  ASSERT_OK(Put("key1", "old_value"));
+  // Recycle the second WAL
+  ASSERT_OK(dbfull()->TEST_SwitchWAL());
+  ASSERT_OK(Put("key1", "new_value"));
+
+  // Create a WAL hole on sequence number by truncating the first WAL to 0 byte
+  VectorWalPtr log_files;
+  ASSERT_OK(db_->GetSortedWalFiles(log_files));
+  ASSERT_EQ(log_files.size(), 2);
+  std::string log_name = LogFileName(dbname_, log_files.front()->LogNumber());
+  Close();
+  // Drop `Put("key1", "old_value")` in the first WAL
+  ASSERT_OK(test::TruncateFile(options.env, log_name, 0 /* new_length */));
+
+  Status s = DB::Open(options, dbname_, &db_);
+
+  ASSERT_OK(s);
+
+  ASSERT_EQ("wal_to_recycle", Get("key_ignore2"));
+  ASSERT_EQ("NOT_FOUND", Get("key1"));
+
+  Close();
+}
+
+class DBWALTrackAndVerifyWALsWithParamsTest
+    : public DBWALTestBase,
+      public ::testing::WithParamInterface<WALRecoveryMode> {
+ public:
+  DBWALTrackAndVerifyWALsWithParamsTest()
+      : DBWALTestBase("/db_wal_track_and_verify_wals_with_params_test") {}
+};
+
+INSTANTIATE_TEST_CASE_P(
+    DBWALTrackAndVerifyWALsWithParamsTest,
+    DBWALTrackAndVerifyWALsWithParamsTest,
+    ::testing::Values(WALRecoveryMode::kTolerateCorruptedTailRecords,
+                      WALRecoveryMode::kAbsoluteConsistency,
+                      WALRecoveryMode::kPointInTimeRecovery,
+                      WALRecoveryMode::kSkipAnyCorruptedRecords));
+
+TEST_P(DBWALTrackAndVerifyWALsWithParamsTest, Basic) {
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals = true;
+  options.wal_recovery_mode = GetParam();
+
+  // Stop background flush to avoid deleting any WAL
+  options.env->SetBackgroundThreads(1, Env::HIGH);
+  test::SleepingBackgroundTask sleeping_task;
+  options.env->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                        &sleeping_task, Env::Priority::HIGH);
+
+  for (int i = 0; i < 5; i++) {
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("key1", "old_value"));
+    SequenceNumber last_seqno_recorded_in_fist_wal =
+        dbfull()->GetLatestSequenceNumber();
+
+    ASSERT_OK(dbfull()->TEST_SwitchWAL());
+    ASSERT_OK(Put("key1", "new_value"));
+
+    VectorWalPtr log_files;
+    ASSERT_OK(db_->GetSortedWalFiles(log_files));
+    ASSERT_EQ(log_files.size(), 2);
+    uint64_t first_log_number = log_files.front()->LogNumber();
+    std::string first_log_name = LogFileName(dbname_, first_log_number);
+    std::string second_log_name =
+        LogFileName(dbname_, log_files.back()->LogNumber());
+
+    if (i == 0) {
+      // Delete the obsolete WAL and verify it will not be seen as a WAL hole
+      sleeping_task.WakeUp();
+      sleeping_task.WaitUntilDone();
+      ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+      // Stop background flush to avoid deleting any WAL
+      sleeping_task.Reset();
+      options.env->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                            &sleeping_task, Env::Priority::HIGH);
+      Close();
+    } else if (i == 1) {
+      // Create a WAL hole on WAL number by deleting the first WAL and verify
+      // the hole will be detected
+      Close();
+      ASSERT_OK(options.env->DeleteFile(first_log_name));
+    } else if (i == 2) {
+      // Create a WAL hole on sequence number by truncating the first WAL and
+      // verify the hole will be detected
+      Close();
+      ASSERT_OK(
+          test::TruncateFile(options.env, first_log_name, 0 /* new_length */));
+    } else if (i == 3) {
+      // Create a WAL hole on size difference by truncating the first WAL and
+      // mocking a correct sequence number to force triggering corruption based
+      // on size instead of sequence number and verify the hole will be detected
+      Close();
+      ASSERT_OK(
+          test::TruncateFile(options.env, first_log_name, 0 /* new_length */));
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::UpdatePredecessorWALInfo", [&](void* arg) {
+            std::pair<uint64_t, SequenceNumber*>* pair =
+                static_cast<std::pair<uint64_t, SequenceNumber*>*>(arg);
+            if (pair->first == first_log_number) {
+              *(pair->second) = last_seqno_recorded_in_fist_wal;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+    } else if (i == 4) {
+      // Delete all wals and verify opening a DB with no WAL will be detected
+      Close();
+      ASSERT_OK(options.env->DeleteFile(first_log_name));
+      ASSERT_OK(options.env->DeleteFile(second_log_name));
+    }
+
+    Status s = DB::Open(options, dbname_, &db_);
+
+    if (i == 0) {
+      ASSERT_OK(s);
+      ASSERT_EQ("new_value", Get("key1"));
+      continue;
+    } else if (i == 3) {
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      SyncPoint::GetInstance()->DisableProcessing();
+    } else if (i == 4) {
+      ASSERT_TRUE(s.IsCorruption());
+      ASSERT_TRUE(
+          s.ToString().find("Opening an existing DB with no WAL files") !=
+          std::string::npos);
+      Close();
+      continue;
+    }
+
+    if (options.wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
+      ASSERT_OK(s);
+      ASSERT_EQ("NOT_FOUND", Get("key1"));
+    } else if (options.wal_recovery_mode ==
+                   WALRecoveryMode::kAbsoluteConsistency ||
+               options.wal_recovery_mode ==
+                   WALRecoveryMode::kTolerateCorruptedTailRecords) {
+      ASSERT_TRUE(s.IsCorruption());
+      std::string msg;
+      if (i == 1) {
+        msg = "Missing WAL";
+      } else if (i == 2) {
+        msg = "Mismatched last sequence number recorded in the WAL";
+      } else if (i == 3) {
+        msg = "Mismatched size of the WAL";
+      }
+      ASSERT_TRUE(s.ToString().find(msg) != std::string::npos);
+    } else {
+      ASSERT_OK(s);
+      ASSERT_EQ("new_value", Get("key1"));
+    }
+
+    Close();
+  }
+}
+
+class DBWALTestWithParams
+    : public DBWALTestBase,
+      public ::testing::WithParamInterface<
+          std::tuple<bool, int, int, CompressionType, bool>> {
  public:
   DBWALTestWithParams() : DBWALTestBase("/db_wal_test_with_params") {}
 };
@@ -1646,7 +2039,8 @@ INSTANTIATE_TEST_CASE_P(
                                             RecoveryTestHelper::kWALFilesCount,
                                         1),
                        ::testing::Values(CompressionType::kNoCompression,
-                                         CompressionType::kZSTD)));
+                                         CompressionType::kZSTD),
+                       ::testing::Bool()));
 
 class DBWALTestWithParamsVaryingRecoveryMode
     : public DBWALTestBase,
@@ -1684,6 +2078,7 @@ TEST_P(DBWALTestWithParams, kTolerateCorruptedTailRecords) {
 
   // Fill data for testing
   Options options = CurrentOptions();
+  options.track_and_verify_wals = std::get<4>(GetParam());
   const size_t row_count = RecoveryTestHelper::FillData(this, &options);
   // test checksum failure or parsing
   RecoveryTestHelper::CorruptWAL(this, options, corrupt_offset * .3,
@@ -1707,6 +2102,7 @@ TEST_P(DBWALTestWithParams, kTolerateCorruptedTailRecords) {
 TEST_P(DBWALTestWithParams, kAbsoluteConsistency) {
   // Verify clean slate behavior
   Options options = CurrentOptions();
+  options.track_and_verify_wals = std::get<4>(GetParam());
   const size_t row_count = RecoveryTestHelper::FillData(this, &options);
   options.create_if_missing = false;
   ASSERT_OK(TryReopen(options));
@@ -1917,7 +2313,6 @@ TEST_F(DBWALTest, FixSyncWalOnObseletedWalWithNewManifestCausingMissingWAL) {
         wal_synced = true;
       });
 
-
   SyncPoint::GetInstance()->EnableProcessing();
 
   ASSERT_OK(Flush());
@@ -1958,6 +2353,7 @@ TEST_P(DBWALTestWithParams, kPointInTimeRecovery) {
 
   // Fill data for testing
   Options options = CurrentOptions();
+  options.track_and_verify_wals = std::get<4>(GetParam());
   options.wal_compression = compression_type;
   const size_t row_count = RecoveryTestHelper::FillData(this, &options);
 
@@ -2015,6 +2411,7 @@ TEST_P(DBWALTestWithParams, kSkipAnyCorruptedRecords) {
 
   // Fill data for testing
   Options options = CurrentOptions();
+  options.track_and_verify_wals = std::get<4>(GetParam());
   options.wal_compression = compression_type;
   const size_t row_count = RecoveryTestHelper::FillData(this, &options);
 
@@ -2492,12 +2889,12 @@ TEST_F(DBWALTest, ReadOnlyRecoveryNoTruncate) {
   // create DB and close with file truncate disabled
   std::atomic_bool enable_truncate{false};
 
-  SyncPoint::GetInstance()->SetCallBack(
-      "PosixWritableFile::Close", [&](void* arg) {
-        if (!enable_truncate) {
-          *(static_cast<size_t*>(arg)) = 0;
-        }
-      });
+  SyncPoint::GetInstance()->SetCallBack("PosixWritableFile::Close",
+                                        [&](void* arg) {
+                                          if (!enable_truncate) {
+                                            *(static_cast<size_t*>(arg)) = 0;
+                                          }
+                                        });
   SyncPoint::GetInstance()->EnableProcessing();
 
   DestroyAndReopen(options);
@@ -2586,7 +2983,6 @@ TEST_F(DBWALTest, WalInManifestButNotInSortedWals) {
   Close();
 }
 
-
 TEST_F(DBWALTest, WalTermTest) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -2628,13 +3024,13 @@ TEST_F(DBWALTest, GetCompressedWalsAfterSync) {
   options.wal_compression = kZSTD;
   DestroyAndReopen(options);
 
-  // Write something to memtable and WAL so that log_empty_ will be false after
+  // Write something to memtable and WAL so that wal_empty_ will be false after
   // next DB::Open().
   ASSERT_OK(Put("a", "v"));
 
   Reopen(options);
 
-  // New WAL is created, thanks to !log_empty_.
+  // New WAL is created, thanks to !wal_empty_.
   ASSERT_OK(dbfull()->TEST_SwitchWAL());
 
   ASSERT_OK(Put("b", "v"));
@@ -2670,6 +3066,83 @@ TEST_F(DBWALTest, EmptyWalReopenTest) {
   }
 }
 
+TEST_F(DBWALTest, RecoveryFlushSwitchWALOnEmptyMemtable) {
+  Options options = CurrentOptions();
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
+  options.env = fault_fs_env.get();
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  // Make sure the memtable switch in recovery flush happened after test checks
+  // the memtable is empty.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBWALTest.RecoveryFlushSwitchWALOnEmptyMemtable:"
+        "AfterCheckMemtableEmpty",
+        "RecoverFromRetryableBGIOError:BeforeStart"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataWrite, 7 /* seed*/, 1 /* one_in */,
+      true /* retryable */, false /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataWrite);
+
+  WriteOptions wo;
+  wo.sync = true;
+  Status s = Put("k", "old_v", wo);
+  ASSERT_TRUE(s.IsIOError());
+  // To verify the key is not in memtable nor SST
+  ASSERT_TRUE(static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())
+                  ->cfd()
+                  ->mem()
+                  ->IsEmpty());
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+  TEST_SYNC_POINT(
+      "DBWALTest.RecoveryFlushSwitchWALOnEmptyMemtable:"
+      "AfterCheckMemtableEmpty");
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  fault_fs->DisableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataWrite);
+
+  // Keep trying write until recovery of the previous IO error finishes
+  while (!s.ok()) {
+    options.env->SleepForMicroseconds(1000);
+    s = Put("k", "new_v");
+  }
+
+  // If recovery flush didn't switch WAL, we will end up having two duplicate
+  // WAL entries with same seqno and same key that violate assertion during WAL
+  // recovery and fail DB reopen
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+
+  ASSERT_EQ("new_v", Get("k"));
+  Destroy(options);
+}
+
+TEST_F(DBWALTest, WALWriteErrorNoRecovery) {
+  Options options = CurrentOptions();
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
+  options.env = fault_fs_env.get();
+  options.manual_wal_flush = true;
+  DestroyAndReopen(options);
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kWrite, 7 /* seed*/, 1 /* one_in */,
+      true /* retryable */, false /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  ASSERT_OK(Put("k", "v"));
+  Status s;
+  s = db_->FlushWAL(false);
+  ASSERT_TRUE(s.IsIOError());
+  s = dbfull()->TEST_GetBGError();
+  ASSERT_EQ(s.severity(), Status::Severity::kFatalError);
+  ASSERT_FALSE(dbfull()->TEST_IsRecoveryInProgress());
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+  Destroy(options);
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

@@ -54,7 +54,7 @@ ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
 
 ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
   if (cfd_ != nullptr) {
-    for (auto& listener : cfd_->ioptions()->listeners) {
+    for (auto& listener : cfd_->ioptions().listeners) {
       listener->OnColumnFamilyHandleDeletionStarted(this);
     }
     // Job id == 0 means that this is not our background process, but rather
@@ -111,23 +111,48 @@ void GetInternalTblPropCollFactory(
   }
 }
 
+Status CheckCompressionSupportedWithManager(
+    CompressionType type, UnownedPtr<CompressionManager> mgr) {
+  if (mgr) {
+    if (!mgr->SupportsCompressionType(type)) {
+      return Status::NotSupported("Compression type " +
+                                  CompressionTypeToString(type) +
+                                  " is not recognized/supported by this "
+                                  "version of CompressionManager " +
+                                  mgr->GetId());
+    }
+  } else {
+    if (!CompressionTypeSupported(type)) {
+      if (type <= kLastBuiltinCompression) {
+        return Status::InvalidArgument("Compression type " +
+                                       CompressionTypeToString(type) +
+                                       " is not linked with the binary.");
+      } else {
+        return Status::NotSupported(
+            "Compression type " + CompressionTypeToString(type) +
+            " is not recognized/supported by built-in CompressionManager.");
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status CheckCompressionSupported(const ColumnFamilyOptions& cf_options) {
   if (!cf_options.compression_per_level.empty()) {
     for (size_t level = 0; level < cf_options.compression_per_level.size();
          ++level) {
-      if (!CompressionTypeSupported(cf_options.compression_per_level[level])) {
-        return Status::InvalidArgument(
-            "Compression type " +
-            CompressionTypeToString(cf_options.compression_per_level[level]) +
-            " is not linked with the binary.");
+      Status s = CheckCompressionSupportedWithManager(
+          cf_options.compression_per_level[level],
+          cf_options.compression_manager.get());
+      if (!s.ok()) {
+        return s;
       }
     }
   } else {
-    if (!CompressionTypeSupported(cf_options.compression)) {
-      return Status::InvalidArgument(
-          "Compression type " +
-          CompressionTypeToString(cf_options.compression) +
-          " is not linked with the binary.");
+    Status s = CheckCompressionSupportedWithManager(
+        cf_options.compression, cf_options.compression_manager.get());
+    if (!s.ok()) {
+      return s;
     }
   }
   if (cf_options.compression_opts.zstd_max_train_bytes > 0) {
@@ -169,7 +194,8 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options) {
   }
   if (!cf_options.memtable_factory->IsInsertConcurrentlySupported()) {
     return Status::InvalidArgument(
-        "Memtable doesn't concurrent writes (allow_concurrent_memtable_write)");
+        "Memtable doesn't allow concurrent writes "
+        "(allow_concurrent_memtable_write)");
   }
   return Status::OK();
 }
@@ -200,8 +226,9 @@ const uint64_t kDefaultTtl = 0xfffffffffffffffe;
 const uint64_t kDefaultPeriodicCompSecs = 0xfffffffffffffffe;
 }  // anonymous namespace
 
-ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
-                                    const ColumnFamilyOptions& src) {
+ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
+                                      bool read_only,
+                                      const ColumnFamilyOptions& src) {
   ColumnFamilyOptions result = src;
   size_t clamp_max = std::conditional<
       sizeof(size_t) == 4, std::integral_constant<size_t, 0xffffffff>,
@@ -240,6 +267,10 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
 
     result.min_write_buffer_number_to_merge = 1;
   }
+  if (result.disallow_memtable_writes) {
+    // A simple memtable that enforces MarkReadOnly (unlike skip list)
+    result.memtable_factory = std::make_shared<VectorRepFactory>();
+  }
 
   if (result.num_levels < 1) {
     result.num_levels = 1;
@@ -257,15 +288,10 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.max_write_buffer_number < 2) {
     result.max_write_buffer_number = 2;
   }
-  // fall back max_write_buffer_number_to_maintain if
-  // max_write_buffer_size_to_maintain is not set
   if (result.max_write_buffer_size_to_maintain < 0) {
     result.max_write_buffer_size_to_maintain =
         result.max_write_buffer_number *
         static_cast<int64_t>(result.write_buffer_size);
-  } else if (result.max_write_buffer_size_to_maintain == 0 &&
-             result.max_write_buffer_number_to_maintain < 0) {
-    result.max_write_buffer_number_to_maintain = result.max_write_buffer_number;
   }
   // bloom filter size shouldn't exceed 1/4 of memtable size.
   if (result.memtable_prefix_bloom_size_ratio > 0.25) {
@@ -436,6 +462,33 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
     result.periodic_compaction_seconds = 0;
   }
 
+  if (read_only && (result.preserve_internal_time_seconds > 0 ||
+                    result.preclude_last_level_data_seconds > 0)) {
+    // With no writes coming in, we don't need periodic SeqnoToTime entries.
+    // Existing SST files may or may not have that info associated with them.
+    ROCKS_LOG_WARN(
+        db_options.info_log.get(),
+        "preserve_internal_time_seconds and preclude_last_level_data_seconds "
+        "are ignored in read-only DB");
+    result.preserve_internal_time_seconds = 0;
+    result.preclude_last_level_data_seconds = 0;
+  }
+
+  if (read_only) {
+    if (result.memtable_op_scan_flush_trigger) {
+      ROCKS_LOG_WARN(db_options.info_log.get(),
+                     "option memtable_op_scan_flush_trigger is sanitized to "
+                     "0(disabled) for read only DB.");
+      result.memtable_op_scan_flush_trigger = 0;
+    }
+    if (result.memtable_avg_op_scan_flush_trigger) {
+      ROCKS_LOG_WARN(
+          db_options.info_log.get(),
+          "option memtable_avg_op_scan_flush_trigger is sanitized to "
+          "0(disabled) for read only DB.");
+      result.memtable_avg_op_scan_flush_trigger = 0;
+    }
+  }
   return result;
 }
 
@@ -467,7 +520,7 @@ void SuperVersion::Cleanup() {
   // decrement reference to the immutable MemtableList
   // this SV object was pointing to.
   imm->Unref(&to_delete);
-  MemTable* m = mem->Unref();
+  ReadOnlyMemTable* m = mem->Unref();
   if (m != nullptr) {
     auto* memory_usage = current->cfd()->imm()->current_memory_usage();
     assert(*memory_usage >= m->ApproximateMemoryUsage());
@@ -493,6 +546,17 @@ void SuperVersion::Init(
   imm->Ref();
   current->Ref();
   refs.store(1, std::memory_order_relaxed);
+
+  // There should be at least one mapping entry iff time tracking is enabled.
+#ifndef NDEBUG
+  MinAndMaxPreserveSeconds preserve_info{mutable_cf_options};
+  if (preserve_info.IsEnabled()) {
+    assert(seqno_to_time_mapping);
+    assert(!seqno_to_time_mapping->Empty());
+  } else {
+    assert(seqno_to_time_mapping == nullptr);
+  }
+#endif  // NDEBUG
 }
 
 namespace {
@@ -531,7 +595,7 @@ ColumnFamilyData::ColumnFamilyData(
     const FileOptions* file_options, ColumnFamilySet* column_family_set,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-    const std::string& db_session_id)
+    const std::string& db_session_id, bool read_only)
     : id_(id),
       name_(name),
       dummy_versions_(_dummy_versions),
@@ -539,8 +603,9 @@ ColumnFamilyData::ColumnFamilyData(
       refs_(0),
       initialized_(false),
       dropped_(false),
+      flush_skip_reschedule_(false),
       internal_comparator_(cf_options.comparator),
-      initial_cf_options_(SanitizeOptions(db_options, cf_options)),
+      initial_cf_options_(SanitizeCfOptions(db_options, read_only, cf_options)),
       ioptions_(db_options, initial_cf_options_),
       mutable_cf_options_(initial_cf_options_),
       is_delete_range_supported_(
@@ -548,7 +613,6 @@ ColumnFamilyData::ColumnFamilyData(
       write_buffer_manager_(write_buffer_manager),
       mem_(nullptr),
       imm_(ioptions_.min_write_buffer_number_to_merge,
-           ioptions_.max_write_buffer_number_to_maintain,
            ioptions_.max_write_buffer_size_to_maintain),
       super_version_(nullptr),
       super_version_number_(0),
@@ -593,10 +657,10 @@ ColumnFamilyData::ColumnFamilyData(
                                       block_cache_tracer, io_tracer,
                                       db_session_id));
     blob_file_cache_.reset(
-        new BlobFileCache(_table_cache, ioptions(), soptions(), id_,
+        new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
                           internal_stats_->GetBlobFileReadHist(), io_tracer));
-    blob_source_.reset(new BlobSource(ioptions(), db_id, db_session_id,
-                                      blob_file_cache_.get()));
+    blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
+                                      db_session_id, blob_file_cache_.get()));
 
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
       compaction_picker_.reset(
@@ -693,9 +757,9 @@ ColumnFamilyData::~ColumnFamilyData() {
   if (mem_ != nullptr) {
     delete mem_->Unref();
   }
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   imm_.current()->Unref(&to_delete);
-  for (MemTable* m : to_delete) {
+  for (auto* m : to_delete) {
     delete m;
   }
 
@@ -901,7 +965,11 @@ uint64_t GetPendingCompactionBytesForCompactionSpeedup(
     return slowdown_threshold;
   }
 
-  uint64_t size_threshold = bottommost_files_size / kBottommostSizeDivisor;
+  // Prevent a small CF from triggering parallel compactions for other CFs.
+  // Require compaction debt to be more than a full L0 to Lbase compaction.
+  const uint64_t kMinDebtSize = 2 * mutable_cf_options.max_bytes_for_level_base;
+  uint64_t size_threshold =
+      std::max(bottommost_files_size / kBottommostSizeDivisor, kMinDebtSize);
   return std::min(size_threshold, slowdown_threshold);
 }
 
@@ -970,7 +1038,7 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
         imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-        *ioptions());
+        ioptions());
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -1162,12 +1230,13 @@ MemTable* ColumnFamilyData::ConstructNewMemtable(
                       write_buffer_manager_, earliest_seq, id_);
 }
 
-void ColumnFamilyData::CreateNewMemtable(
-    const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
+void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
   if (mem_ != nullptr) {
     delete mem_->Unref();
   }
-  SetMemtable(ConstructNewMemtable(mutable_cf_options, earliest_seq));
+  // NOTE: db mutex must be locked for SetMemtable, so safe for
+  // GetLatestMutableCFOptions
+  SetMemtable(ConstructNewMemtable(GetLatestMutableCFOptions(), earliest_seq));
   mem_->Ref();
 }
 
@@ -1178,10 +1247,14 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 Compaction* ColumnFamilyData::PickCompaction(
     const MutableCFOptions& mutable_options,
-    const MutableDBOptions& mutable_db_options, LogBuffer* log_buffer) {
+    const MutableDBOptions& mutable_db_options,
+    const std::vector<SequenceNumber>& existing_snapshots,
+    const SnapshotChecker* snapshot_checker, LogBuffer* log_buffer,
+    bool require_max_output_level) {
   auto* result = compaction_picker_->PickCompaction(
-      GetName(), mutable_options, mutable_db_options, current_->storage_info(),
-      log_buffer);
+      GetName(), mutable_options, mutable_db_options, existing_snapshots,
+      snapshot_checker, current_->storage_info(), log_buffer,
+      require_max_output_level);
   if (result != nullptr) {
     result->FinalizeInputInfo(current_);
   }
@@ -1207,11 +1280,13 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
   read_opts.total_order_seek = true;
   MergeIteratorBuilder merge_iter_builder(&internal_comparator_, &arena);
   merge_iter_builder.AddIterator(super_version->mem->NewIterator(
-      read_opts, /*seqno_to_time_mapping=*/nullptr, &arena));
+      read_opts, /*seqno_to_time_mapping=*/nullptr, &arena,
+      /*prefix_extractor=*/nullptr, /*for_flush=*/false));
   super_version->imm->AddIterators(read_opts, /*seqno_to_time_mapping=*/nullptr,
+                                   /*prefix_extractor=*/nullptr,
                                    &merge_iter_builder,
                                    false /* add_range_tombstone_iter */);
-  ScopedArenaIterator memtable_iter(merge_iter_builder.Finish());
+  ScopedArenaPtr<InternalIterator> memtable_iter(merge_iter_builder.Finish());
 
   auto read_seq = super_version->current->version_set()->LastSequence();
   ReadRangeDelAggregator range_del_agg(&internal_comparator_, read_seq);
@@ -1336,20 +1411,17 @@ bool ColumnFamilyData::ReturnThreadLocalSuperVersion(SuperVersion* sv) {
   return false;
 }
 
-void ColumnFamilyData::InstallSuperVersion(SuperVersionContext* sv_context,
-                                           InstrumentedMutex* db_mutex) {
-  db_mutex->AssertHeld();
-  return InstallSuperVersion(sv_context, mutable_cf_options_);
-}
-
 void ColumnFamilyData::InstallSuperVersion(
-    SuperVersionContext* sv_context,
-    const MutableCFOptions& mutable_cf_options) {
+    SuperVersionContext* sv_context, InstrumentedMutex* db_mutex,
+    std::optional<std::shared_ptr<SeqnoToTimeMapping>>
+        new_seqno_to_time_mapping) {
+  db_mutex->AssertHeld();
+
   SuperVersion* new_superversion = sv_context->new_superversion.release();
-  new_superversion->mutable_cf_options = mutable_cf_options;
+  new_superversion->mutable_cf_options = GetLatestMutableCFOptions();
   new_superversion->Init(this, mem_, imm_.current(), current_,
-                         sv_context->new_seqno_to_time_mapping
-                             ? std::move(sv_context->new_seqno_to_time_mapping)
+                         new_seqno_to_time_mapping.has_value()
+                             ? std::move(new_seqno_to_time_mapping.value())
                          : super_version_
                              ? super_version_->ShareSeqnoToTimeMapping()
                              : nullptr);
@@ -1362,7 +1434,7 @@ void ColumnFamilyData::InstallSuperVersion(
     // currently RecalculateWriteStallConditions() treats it as further slowing
     // down is needed.
     super_version_->write_stall_condition =
-        RecalculateWriteStallConditions(mutable_cf_options);
+        RecalculateWriteStallConditions(new_superversion->mutable_cf_options);
   } else {
     super_version_->write_stall_condition =
         old_superversion->write_stall_condition;
@@ -1375,14 +1447,15 @@ void ColumnFamilyData::InstallSuperVersion(
     ResetThreadLocalSuperVersions();
 
     if (old_superversion->mutable_cf_options.write_buffer_size !=
-        mutable_cf_options.write_buffer_size) {
-      mem_->UpdateWriteBufferSize(mutable_cf_options.write_buffer_size);
+        new_superversion->mutable_cf_options.write_buffer_size) {
+      mem_->UpdateWriteBufferSize(
+          new_superversion->mutable_cf_options.write_buffer_size);
     }
     if (old_superversion->write_stall_condition !=
         new_superversion->write_stall_condition) {
       sv_context->PushWriteStallNotification(
           old_superversion->write_stall_condition,
-          new_superversion->write_stall_condition, GetName(), ioptions());
+          new_superversion->write_stall_condition, GetName(), &ioptions());
     }
     if (old_superversion->Unref()) {
       old_superversion->Cleanup();
@@ -1535,6 +1608,20 @@ Status ColumnFamilyData::ValidateOptions(
       }
     }
   }
+
+  if (cf_options.compaction_style == kCompactionStyleUniversal) {
+    int max_read_amp = cf_options.compaction_options_universal.max_read_amp;
+    if (max_read_amp < -1) {
+      return Status::NotSupported(
+          "CompactionOptionsUniversal::max_read_amp should be at least -1.");
+    } else if (0 < max_read_amp &&
+               max_read_amp < cf_options.level0_file_num_compaction_trigger) {
+      return Status::NotSupported(
+          "CompactionOptionsUniversal::max_read_amp limits the number of sorted"
+          " runs but is smaller than the compaction trigger "
+          "level0_file_num_compaction_trigger.");
+    }
+  }
   return s;
 }
 
@@ -1545,9 +1632,16 @@ Status ColumnFamilyData::SetOptions(
       BuildColumnFamilyOptions(initial_cf_options_, mutable_cf_options_);
   ConfigOptions config_opts;
   config_opts.mutable_options_only = true;
+#ifndef NDEBUG
+  if (TEST_allowSetOptionsImmutableInMutable) {
+    config_opts.mutable_options_only = false;
+  }
+#endif
   Status s = GetColumnFamilyOptionsFromMap(config_opts, cf_opts, options_map,
                                            &cf_opts);
   if (s.ok()) {
+    // FIXME: we should call SanitizeOptions() too or consolidate it with
+    // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
   }
   if (s.ok()) {
@@ -1555,28 +1649,6 @@ Status ColumnFamilyData::SetOptions(
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
   }
   return s;
-}
-
-// REQUIRES: DB mutex held
-Env::WriteLifeTimeHint ColumnFamilyData::CalculateSSTWriteHint(int level) {
-  if (initial_cf_options_.compaction_style != kCompactionStyleLevel) {
-    return Env::WLTH_NOT_SET;
-  }
-  if (level == 0) {
-    return Env::WLTH_MEDIUM;
-  }
-  int base_level = current_->storage_info()->base_level();
-
-  // L1: medium, L2: long, ...
-  if (level - base_level >= 2) {
-    return Env::WLTH_EXTREME;
-  } else if (level < base_level) {
-    // There is no restriction which prevents level passed in to be smaller
-    // than base_level.
-    return Env::WLTH_MEDIUM;
-  }
-  return static_cast<Env::WriteLifeTimeHint>(
-      level - base_level + static_cast<int>(Env::WLTH_MEDIUM));
 }
 
 Status ColumnFamilyData::AddDirectories(
@@ -1614,6 +1686,19 @@ FSDirectory* ColumnFamilyData::GetDataDir(size_t path_id) const {
   return data_dirs_[path_id].get();
 }
 
+void ColumnFamilyData::SetFlushSkipReschedule() {
+  const Comparator* ucmp = user_comparator();
+  const size_t ts_sz = ucmp->timestamp_size();
+  if (ts_sz == 0 || ioptions_.persist_user_defined_timestamps) {
+    return;
+  }
+  flush_skip_reschedule_.store(true);
+}
+
+bool ColumnFamilyData::GetAndClearFlushSkipReschedule() {
+  return flush_skip_reschedule_.exchange(false);
+}
+
 bool ColumnFamilyData::ShouldPostponeFlushToRetainUDT(
     uint64_t max_memtable_id) {
   const Comparator* ucmp = user_comparator();
@@ -1631,6 +1716,9 @@ bool ColumnFamilyData::ShouldPostponeFlushToRetainUDT(
   }
   for (const Slice& table_newest_udt :
        imm()->GetTablesNewestUDT(max_memtable_id)) {
+    if (table_newest_udt.empty()) {
+      continue;
+    }
     assert(table_newest_udt.size() == full_history_ts_low.size());
     // Checking the newest UDT contained in MemTable with ascending ID up to
     // `max_memtable_id`. Return immediately on finding the first MemTable that
@@ -1665,7 +1753,8 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
       dummy_cfd_(new ColumnFamilyData(
           ColumnFamilyData::kDummyColumnFamilyDataId, "", nullptr, nullptr,
           nullptr, ColumnFamilyOptions(), *db_options, &file_options_, nullptr,
-          block_cache_tracer, io_tracer, db_id, db_session_id)),
+          block_cache_tracer, io_tracer, db_id, db_session_id,
+          /*read_only*/ true)),
       default_cfd_cache_(nullptr),
       db_name_(dbname),
       db_options_(db_options),
@@ -1738,12 +1827,12 @@ size_t ColumnFamilySet::NumberOfColumnFamilies() const {
 // under a DB mutex AND write thread
 ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
     const std::string& name, uint32_t id, Version* dummy_versions,
-    const ColumnFamilyOptions& options) {
+    const ColumnFamilyOptions& options, bool read_only) {
   assert(column_families_.find(name) == column_families_.end());
   ColumnFamilyData* new_cfd = new ColumnFamilyData(
       id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
       *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
-      db_id_, db_session_id_);
+      db_id_, db_session_id_, read_only);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
   auto ucmp = new_cfd->user_comparator();
@@ -1831,10 +1920,7 @@ const ImmutableOptions& GetImmutableOptions(ColumnFamilyHandle* column_family) {
   const ColumnFamilyData* const cfd = handle->cfd();
   assert(cfd);
 
-  const ImmutableOptions* ioptions = cfd->ioptions();
-  assert(ioptions);
-
-  return *ioptions;
+  return cfd->ioptions();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

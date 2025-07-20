@@ -25,11 +25,11 @@ struct MutableDBOptions;
 struct MutableCFOptions;
 struct Options;
 
-std::vector<CompressionType> GetSupportedCompressions();
+const std::vector<CompressionType>& GetSupportedCompressions();
 
-std::vector<CompressionType> GetSupportedDictCompressions();
+const std::vector<CompressionType>& GetSupportedDictCompressions();
 
-std::vector<ChecksumType> GetSupportedChecksums();
+const std::vector<ChecksumType>& GetSupportedChecksums();
 
 inline bool IsSupportedChecksumType(ChecksumType type) {
   // Avoid annoying compiler warning-as-error (-Werror=type-limits)
@@ -44,6 +44,10 @@ Status ValidateOptions(const DBOptions& db_opts,
 
 DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
                          const MutableDBOptions& mutable_db_options);
+// Overwrites `options`
+void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
+                    const MutableDBOptions& mutable_db_options,
+                    DBOptions& options);
 
 ColumnFamilyOptions BuildColumnFamilyOptions(
     const ColumnFamilyOptions& ioptions,

@@ -139,10 +139,14 @@ class CompressedSecondaryCache : public SecondaryCache {
                         const Cache::CacheItemHelper* helper,
                         CompressionType type, CacheTier source);
 
+  size_t TEST_GetCharge(const Slice& key);
+
   // TODO: clean up to use cleaner interfaces in typed_cache.h
   const Cache::CacheItemHelper* GetHelper(bool enable_custom_split_merge) const;
   std::shared_ptr<Cache> cache_;
   CompressedSecondaryCacheOptions cache_options_;
+  std::unique_ptr<Compressor> compressor_;
+  std::shared_ptr<Decompressor> decompressor_;
   mutable port::Mutex capacity_mutex_;
   std::shared_ptr<ConcurrentCacheReservationManager> cache_res_mgr_;
   bool disable_cache_;

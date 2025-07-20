@@ -71,6 +71,7 @@ enum class LevelStatType {
   RN_GB,
   RNP1_GB,
   WRITE_GB,
+  WRITE_PRE_COMP_GB,
   W_NEW_GB,
   MOVED_GB,
   WRITE_AMP,
@@ -153,23 +154,6 @@ class InternalStats {
 
   InternalStats(int num_levels, SystemClock* clock, ColumnFamilyData* cfd);
 
-  // Per level compaction stats
-  struct CompactionOutputsStats {
-    uint64_t num_output_records = 0;
-    uint64_t bytes_written = 0;
-    uint64_t bytes_written_blob = 0;
-    uint64_t num_output_files = 0;
-    uint64_t num_output_files_blob = 0;
-
-    void Add(const CompactionOutputsStats& stats) {
-      this->num_output_records += stats.num_output_records;
-      this->bytes_written += stats.bytes_written;
-      this->bytes_written_blob += stats.bytes_written_blob;
-      this->num_output_files += stats.num_output_files;
-      this->num_output_files_blob += stats.num_output_files_blob;
-    }
-  };
-
   // Per level compaction stats.  comp_stats_[level] stores the stats for
   // compactions that produced data for the specified "level".
   struct CompactionStats {
@@ -182,11 +166,22 @@ class InternalStats {
     // The number of bytes read from the compaction output level (table files)
     uint64_t bytes_read_output_level;
 
+    // The number of bytes skipped from all non-output levels because the input
+    // files are filtered by compaction optimizations.
+    uint64_t bytes_skipped_non_output_levels;
+
+    // The number of bytes skipped from the compaction output level because the
+    // input files are filtered by compaction optimizations.
+    uint64_t bytes_skipped_output_level;
+
     // The number of bytes read from blob files
     uint64_t bytes_read_blob;
 
     // Total number of bytes written to table files during compaction
     uint64_t bytes_written;
+
+    // Total number of bytes written pre-compression during compaction
+    uint64_t bytes_written_pre_comp;
 
     // Total number of bytes written to blob files during compaction
     uint64_t bytes_written_blob;
@@ -200,6 +195,14 @@ class InternalStats {
 
     // The number of compaction input files in the output level (table files)
     int num_input_files_in_output_level;
+
+    // The number of non output level compaction input files that are filtered
+    // by compaction optimizations.
+    int num_filtered_input_files_in_non_output_levels;
+
+    // The number of output level compaction input files that are filtered by
+    // compaction optimizations.
+    int num_filtered_input_files_in_output_level;
 
     // The number of compaction output files (table files)
     int num_output_files;
@@ -228,12 +231,17 @@ class InternalStats {
           cpu_micros(0),
           bytes_read_non_output_levels(0),
           bytes_read_output_level(0),
+          bytes_skipped_non_output_levels(0),
+          bytes_skipped_output_level(0),
           bytes_read_blob(0),
           bytes_written(0),
+          bytes_written_pre_comp(0),
           bytes_written_blob(0),
           bytes_moved(0),
           num_input_files_in_non_output_levels(0),
           num_input_files_in_output_level(0),
+          num_filtered_input_files_in_non_output_levels(0),
+          num_filtered_input_files_in_output_level(0),
           num_output_files(0),
           num_output_files_blob(0),
           num_input_records(0),
@@ -251,12 +259,17 @@ class InternalStats {
           cpu_micros(0),
           bytes_read_non_output_levels(0),
           bytes_read_output_level(0),
+          bytes_skipped_non_output_levels(0),
+          bytes_skipped_output_level(0),
           bytes_read_blob(0),
           bytes_written(0),
+          bytes_written_pre_comp(0),
           bytes_written_blob(0),
           bytes_moved(0),
           num_input_files_in_non_output_levels(0),
           num_input_files_in_output_level(0),
+          num_filtered_input_files_in_non_output_levels(0),
+          num_filtered_input_files_in_output_level(0),
           num_output_files(0),
           num_output_files_blob(0),
           num_input_records(0),
@@ -280,13 +293,20 @@ class InternalStats {
           cpu_micros(c.cpu_micros),
           bytes_read_non_output_levels(c.bytes_read_non_output_levels),
           bytes_read_output_level(c.bytes_read_output_level),
+          bytes_skipped_non_output_levels(c.bytes_skipped_non_output_levels),
+          bytes_skipped_output_level(c.bytes_skipped_output_level),
           bytes_read_blob(c.bytes_read_blob),
           bytes_written(c.bytes_written),
+          bytes_written_pre_comp(c.bytes_written_pre_comp),
           bytes_written_blob(c.bytes_written_blob),
           bytes_moved(c.bytes_moved),
           num_input_files_in_non_output_levels(
               c.num_input_files_in_non_output_levels),
           num_input_files_in_output_level(c.num_input_files_in_output_level),
+          num_filtered_input_files_in_non_output_levels(
+              c.num_filtered_input_files_in_non_output_levels),
+          num_filtered_input_files_in_output_level(
+              c.num_filtered_input_files_in_output_level),
           num_output_files(c.num_output_files),
           num_output_files_blob(c.num_output_files_blob),
           num_input_records(c.num_input_records),
@@ -304,13 +324,20 @@ class InternalStats {
       cpu_micros = c.cpu_micros;
       bytes_read_non_output_levels = c.bytes_read_non_output_levels;
       bytes_read_output_level = c.bytes_read_output_level;
+      bytes_skipped_non_output_levels = c.bytes_skipped_non_output_levels;
+      bytes_skipped_output_level = c.bytes_skipped_output_level;
       bytes_read_blob = c.bytes_read_blob;
       bytes_written = c.bytes_written;
+      bytes_written_pre_comp = c.bytes_written_pre_comp;
       bytes_written_blob = c.bytes_written_blob;
       bytes_moved = c.bytes_moved;
       num_input_files_in_non_output_levels =
           c.num_input_files_in_non_output_levels;
       num_input_files_in_output_level = c.num_input_files_in_output_level;
+      num_filtered_input_files_in_non_output_levels =
+          c.num_filtered_input_files_in_non_output_levels;
+      num_filtered_input_files_in_output_level =
+          c.num_filtered_input_files_in_output_level;
       num_output_files = c.num_output_files;
       num_output_files_blob = c.num_output_files_blob;
       num_input_records = c.num_input_records;
@@ -330,12 +357,17 @@ class InternalStats {
       this->cpu_micros = 0;
       this->bytes_read_non_output_levels = 0;
       this->bytes_read_output_level = 0;
+      this->bytes_skipped_non_output_levels = 0;
+      this->bytes_skipped_output_level = 0;
       this->bytes_read_blob = 0;
       this->bytes_written = 0;
+      this->bytes_written_pre_comp = 0;
       this->bytes_written_blob = 0;
       this->bytes_moved = 0;
       this->num_input_files_in_non_output_levels = 0;
       this->num_input_files_in_output_level = 0;
+      this->num_filtered_input_files_in_non_output_levels = 0;
+      this->num_filtered_input_files_in_output_level = 0;
       this->num_output_files = 0;
       this->num_output_files_blob = 0;
       this->num_input_records = 0;
@@ -353,14 +385,22 @@ class InternalStats {
       this->cpu_micros += c.cpu_micros;
       this->bytes_read_non_output_levels += c.bytes_read_non_output_levels;
       this->bytes_read_output_level += c.bytes_read_output_level;
+      this->bytes_skipped_non_output_levels +=
+          c.bytes_skipped_non_output_levels;
+      this->bytes_skipped_output_level += c.bytes_skipped_output_level;
       this->bytes_read_blob += c.bytes_read_blob;
       this->bytes_written += c.bytes_written;
+      this->bytes_written_pre_comp += c.bytes_written_pre_comp;
       this->bytes_written_blob += c.bytes_written_blob;
       this->bytes_moved += c.bytes_moved;
       this->num_input_files_in_non_output_levels +=
           c.num_input_files_in_non_output_levels;
       this->num_input_files_in_output_level +=
           c.num_input_files_in_output_level;
+      this->num_filtered_input_files_in_non_output_levels +=
+          c.num_filtered_input_files_in_non_output_levels;
+      this->num_filtered_input_files_in_output_level +=
+          c.num_filtered_input_files_in_output_level;
       this->num_output_files += c.num_output_files;
       this->num_output_files_blob += c.num_output_files_blob;
       this->num_input_records += c.num_input_records;
@@ -373,28 +413,27 @@ class InternalStats {
       }
     }
 
-    void Add(const CompactionOutputsStats& stats) {
-      this->num_output_files += static_cast<int>(stats.num_output_files);
-      this->num_output_records += stats.num_output_records;
-      this->bytes_written += stats.bytes_written;
-      this->bytes_written_blob += stats.bytes_written_blob;
-      this->num_output_files_blob +=
-          static_cast<int>(stats.num_output_files_blob);
-    }
-
     void Subtract(const CompactionStats& c) {
       this->micros -= c.micros;
       this->cpu_micros -= c.cpu_micros;
       this->bytes_read_non_output_levels -= c.bytes_read_non_output_levels;
       this->bytes_read_output_level -= c.bytes_read_output_level;
+      this->bytes_skipped_non_output_levels -=
+          c.bytes_skipped_non_output_levels;
+      this->bytes_skipped_output_level -= c.bytes_skipped_output_level;
       this->bytes_read_blob -= c.bytes_read_blob;
       this->bytes_written -= c.bytes_written;
+      this->bytes_written_pre_comp -= c.bytes_written_pre_comp;
       this->bytes_written_blob -= c.bytes_written_blob;
       this->bytes_moved -= c.bytes_moved;
       this->num_input_files_in_non_output_levels -=
           c.num_input_files_in_non_output_levels;
       this->num_input_files_in_output_level -=
           c.num_input_files_in_output_level;
+      this->num_filtered_input_files_in_non_output_levels -=
+          c.num_filtered_input_files_in_non_output_levels;
+      this->num_filtered_input_files_in_output_level -=
+          c.num_filtered_input_files_in_output_level;
       this->num_output_files -= c.num_output_files;
       this->num_output_files_blob -= c.num_output_files_blob;
       this->num_input_records -= c.num_input_records;
@@ -419,49 +458,51 @@ class InternalStats {
     }
   };
 
-  // Compaction stats, for per_key_placement compaction, it includes 2 levels
-  // stats: the last level and the penultimate level.
+  // Compaction internal stats, for per_key_placement compaction, it includes 2
+  // output level stats: the last level and the proximal level.
   struct CompactionStatsFull {
     // the stats for the target primary output level
-    CompactionStats stats;
+    CompactionStats output_level_stats;
 
-    // stats for penultimate level output if exist
-    bool has_penultimate_level_output = false;
-    CompactionStats penultimate_level_stats;
+    // stats for proximal level output if exist
+    bool has_proximal_level_output = false;
+    CompactionStats proximal_level_stats;
 
-    explicit CompactionStatsFull() : stats(), penultimate_level_stats() {}
+    explicit CompactionStatsFull()
+        : output_level_stats(), proximal_level_stats() {}
 
     explicit CompactionStatsFull(CompactionReason reason, int c)
-        : stats(reason, c), penultimate_level_stats(reason, c){}
+        : output_level_stats(reason, c), proximal_level_stats(reason, c) {}
 
     uint64_t TotalBytesWritten() const {
-      uint64_t bytes_written = stats.bytes_written + stats.bytes_written_blob;
-      if (has_penultimate_level_output) {
-        bytes_written += penultimate_level_stats.bytes_written +
-                         penultimate_level_stats.bytes_written_blob;
+      uint64_t bytes_written = output_level_stats.bytes_written +
+                               output_level_stats.bytes_written_blob;
+      if (has_proximal_level_output) {
+        bytes_written += proximal_level_stats.bytes_written +
+                         proximal_level_stats.bytes_written_blob;
       }
       return bytes_written;
     }
 
     uint64_t DroppedRecords() {
-      uint64_t output_records = stats.num_output_records;
-      if (has_penultimate_level_output) {
-        output_records += penultimate_level_stats.num_output_records;
+      uint64_t output_records = output_level_stats.num_output_records;
+      if (has_proximal_level_output) {
+        output_records += proximal_level_stats.num_output_records;
       }
-      if (stats.num_input_records > output_records) {
-        return stats.num_input_records - output_records;
+      if (output_level_stats.num_input_records > output_records) {
+        return output_level_stats.num_input_records - output_records;
       }
       return 0;
     }
 
     void SetMicros(uint64_t val) {
-      stats.micros = val;
-      penultimate_level_stats.micros = val;
+      output_level_stats.micros = val;
+      proximal_level_stats.micros = val;
     }
 
     void AddCpuMicros(uint64_t val) {
-      stats.cpu_micros += val;
-      penultimate_level_stats.cpu_micros += val;
+      output_level_stats.cpu_micros += val;
+      proximal_level_stats.cpu_micros += val;
     }
   };
 
@@ -533,10 +574,9 @@ class InternalStats {
 
   void AddCompactionStats(int level, Env::Priority thread_pri,
                           const CompactionStatsFull& comp_stats_full) {
-    AddCompactionStats(level, thread_pri, comp_stats_full.stats);
-    if (comp_stats_full.has_penultimate_level_output) {
-      per_key_placement_comp_stats_.Add(
-          comp_stats_full.penultimate_level_stats);
+    AddCompactionStats(level, thread_pri, comp_stats_full.output_level_stats);
+    if (comp_stats_full.has_proximal_level_output) {
+      per_key_placement_comp_stats_.Add(comp_stats_full.proximal_level_stats);
     }
   }
 
@@ -548,6 +588,20 @@ class InternalStats {
     has_cf_change_since_dump_ = true;
     cf_stats_value_[type] += value;
     ++cf_stats_count_[type];
+  }
+
+  void IncrNumRunningCompactionSortedRuns(uint64_t value) {
+    num_running_compaction_sorted_runs_.fetch_add(value,
+                                                  std::memory_order_relaxed);
+  }
+
+  void DecrNumRunningCompactionSortedRuns(uint64_t value) {
+    num_running_compaction_sorted_runs_.fetch_sub(value,
+                                                  std::memory_order_relaxed);
+  }
+
+  uint64_t NumRunningCompactionSortedRuns() {
+    return num_running_compaction_sorted_runs_.load(std::memory_order_relaxed);
   }
 
   void AddDBStats(InternalDBStatsType type, uint64_t value,
@@ -654,7 +708,10 @@ class InternalStats {
   // a full cache, which would force a re-scan on the next GetStats.
   std::shared_ptr<CacheEntryStatsCollector<CacheEntryRoleStats>>
       cache_entry_stats_collector_;
-  // Per-ColumnFamily/level compaction stats
+
+  // Per-column family and level compaction statistics, including flush and file
+  // ingestion. These are treated as compactions to L0 or the level where the
+  // file was ingested.
   std::vector<CompactionStats> comp_stats_;
   std::vector<CompactionStats> comp_stats_by_pri_;
   CompactionStats per_key_placement_comp_stats_;
@@ -793,6 +850,8 @@ class InternalStats {
   bool HandleCompactionPending(uint64_t* value, DBImpl* db, Version* version);
   bool HandleNumRunningCompactions(uint64_t* value, DBImpl* db,
                                    Version* version);
+  bool HandleNumRunningCompactionSortedRuns(uint64_t* value, DBImpl* db,
+                                            Version* version);
   bool HandleBackgroundErrors(uint64_t* value, DBImpl* db, Version* version);
   bool HandleCurSizeActiveMemTable(uint64_t* value, DBImpl* db,
                                    Version* version);
@@ -867,11 +926,36 @@ class InternalStats {
   // or compaction will cause the counter to increase too.
   uint64_t bg_error_count_;
 
+  // This is a rolling count of the number of sorted runs being processed by
+  // currently running compactions. Other metrics are only incremented, but this
+  // metric is also decremented. Additionally, we also do not want to reset this
+  // count to zero at a periodic interval.
+  std::atomic<uint64_t> num_running_compaction_sorted_runs_;
+
   const int number_levels_;
   SystemClock* clock_;
   ColumnFamilyData* cfd_;
   uint64_t started_at_;
 };
 
+// IntPropertyAggregator aggregates an integer property across all column
+// families.
+class IntPropertyAggregator {
+ public:
+  IntPropertyAggregator() {}
+  virtual ~IntPropertyAggregator() {}
+
+  IntPropertyAggregator(const IntPropertyAggregator&) = delete;
+  void operator=(const IntPropertyAggregator&) = delete;
+
+  // Add a column family's property value to the aggregator.
+  virtual void Add(ColumnFamilyData* cfd, uint64_t value) = 0;
+
+  // Get the aggregated value.
+  virtual uint64_t Aggregate() const = 0;
+};
+
+std::unique_ptr<IntPropertyAggregator> CreateIntPropertyAggregator(
+    const Slice& property);
 
 }  // namespace ROCKSDB_NAMESPACE

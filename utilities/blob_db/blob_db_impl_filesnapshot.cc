@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "util/cast_util.h"
@@ -102,6 +101,26 @@ void BlobDBImpl::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
     filemetadata.column_family_name = cfh->GetName();
     metadata->emplace_back(filemetadata);
   }
+}
+
+Status BlobDBImpl::GetLiveFilesStorageInfo(
+    const LiveFilesStorageInfoOptions& opts,
+    std::vector<LiveFileStorageInfo>* files) {
+  ReadLock rl(&mutex_);
+  Status s = db_->GetLiveFilesStorageInfo(opts, files);
+  if (s.ok()) {
+    files->reserve(files->size() + blob_files_.size());
+    for (const auto& [blob_number, blob_file] : blob_files_) {
+      LiveFileStorageInfo file;
+      file.size = blob_file->GetFileSize();
+      file.directory = blob_dir_;
+      file.relative_filename = BlobFileName(blob_number);
+      file.file_type = kBlobFile;
+      file.trim_to_size = true;
+      files->push_back(std::move(file));
+    }
+  }
+  return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE::blob_db

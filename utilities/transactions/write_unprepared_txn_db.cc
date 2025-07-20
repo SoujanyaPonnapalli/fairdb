@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/write_unprepared_txn_db.h"
 
 #include "db/arena_wrapped_db_iter.h"
@@ -180,7 +179,8 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
     const size_t kOneBatch = 1;
     uint64_t seq_used = kMaxSequenceNumber;
     s = db_impl_->WriteImpl(w_options, &rollback_batch, nullptr, nullptr,
-                            kNoLogRef, !kDisableMemtable, &seq_used, kOneBatch);
+                            nullptr, kNoLogRef, !kDisableMemtable, &seq_used,
+                            kOneBatch);
     if (!s.ok()) {
       return s;
     }

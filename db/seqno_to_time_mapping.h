@@ -138,7 +138,7 @@ class SeqnoToTimeMapping {
   // Adds a series of mappings interpolating from from_seqno->from_time to
   // to_seqno->to_time. This can only be called on an empty object and both
   // seqno range and time range are inclusive.
-  bool PrePopulate(SequenceNumber from_seqno, SequenceNumber to_seqno,
+  void PrePopulate(SequenceNumber from_seqno, SequenceNumber to_seqno,
                    uint64_t from_time, uint64_t to_time);
 
   // Append a new entry to the list. The `seqno` should be >= all previous
@@ -147,6 +147,10 @@ class SeqnoToTimeMapping {
   // Returns false if the entry was merged into the most recent entry
   // rather than creating a new entry.
   bool Append(SequenceNumber seqno, uint64_t time);
+
+  bool Append(std::pair<SequenceNumber, uint64_t> seqno_time_pair) {
+    return Append(seqno_time_pair.first, seqno_time_pair.second);
+  }
 
   // Clear all entries and (re-)enter enforced mode if not already in that
   // state. Enforced limits are unchanged.
@@ -213,6 +217,15 @@ class SeqnoToTimeMapping {
   // must be in enforced state as a precondition.
   SequenceNumber GetProximalSeqnoBeforeTime(uint64_t time) const;
 
+  // Given current time, the configured `preserve_internal_time_seconds`, and
+  // `preclude_last_level_data_seconds`, find the relevant cutoff sequence
+  // numbers for tiering.
+  void GetCurrentTieringCutoffSeqnos(
+      uint64_t current_time, uint64_t preserve_internal_time_seconds,
+      uint64_t preclude_last_level_data_seconds,
+      SequenceNumber* preserve_time_min_seqno,
+      SequenceNumber* preclude_last_level_min_seqno) const;
+
   // Encode to a binary string by appending to `dest`.
   // Because this is a const operation depending on sortedness, the structure
   // must be in enforced state as a precondition.
@@ -265,6 +278,48 @@ class SeqnoToTimeMapping {
   pair_const_iterator FindGreaterEqSeqno(SequenceNumber seqno) const;
 };
 
+// A struct to help combining settings across column families
+struct MinAndMaxPreserveSeconds {
+  uint64_t min_preserve_seconds = std::numeric_limits<uint64_t>::max();
+  uint64_t max_preserve_seconds = std::numeric_limits<uint64_t>::min();
+
+  MinAndMaxPreserveSeconds() = default;
+
+  template <class CFOpts>
+  explicit MinAndMaxPreserveSeconds(const CFOpts& opts) {
+    Combine(opts);
+  }
+
+  bool IsEnabled() const {
+    return min_preserve_seconds != std::numeric_limits<uint64_t>::max();
+  }
+
+  // Incorporate another CF's settings into the result. If preserve/preclude are
+  // disabled for this CF, they are excluded from the result.
+  template <class CFOpts>
+  void Combine(const CFOpts& opts) {
+    uint64_t preserve_seconds = std::max(opts.preserve_internal_time_seconds,
+                                         opts.preclude_last_level_data_seconds);
+    if (preserve_seconds > 0) {
+      min_preserve_seconds = std::min(preserve_seconds, min_preserve_seconds);
+      max_preserve_seconds = std::max(preserve_seconds, max_preserve_seconds);
+    }
+  }
+
+  // Choose how many seconds between mapping samples
+  uint64_t GetRecodingCadence() const {
+    if (IsEnabled()) {
+      // round up to 1 when the time_duration is smaller than
+      // kMaxSeqnoTimePairsPerCF
+      return (min_preserve_seconds + kMaxSeqnoTimePairsPerCF - 1) /
+             kMaxSeqnoTimePairsPerCF;
+    } else {
+      // disabled
+      return 0;
+    }
+  }
+};
+
 // === Utility methods used for TimedPut === //
 
 // Pack a value Slice and a unix write time into buffer `buf` and return a Slice
@@ -277,9 +332,15 @@ Slice PackValueAndWriteTime(const Slice& value, uint64_t unix_write_time,
 Slice PackValueAndSeqno(const Slice& value, SequenceNumber seqno,
                         std::string* buf);
 
+// Parse a packed value to get the write time.
+uint64_t ParsePackedValueForWriteTime(const Slice& value);
+
 // Parse a packed value to get the value and the write time. The unpacked value
 // Slice is backed up by the same memory backing up `value`.
 std::tuple<Slice, uint64_t> ParsePackedValueWithWriteTime(const Slice& value);
+
+// Parse a packed value to get the sequence number.
+SequenceNumber ParsePackedValueForSeqno(const Slice& value);
 
 // Parse a packed value to get the value and the sequence number. The unpacked
 // value Slice is backed up by the same memory backing up `value`.

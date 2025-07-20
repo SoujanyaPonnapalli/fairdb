@@ -836,19 +836,6 @@ public class ColumnFamilyOptions
   }
 
   @Override
-  public ColumnFamilyOptions setMaxWriteBufferNumberToMaintain(
-      final int maxWriteBufferNumberToMaintain) {
-    setMaxWriteBufferNumberToMaintain(
-        nativeHandle_, maxWriteBufferNumberToMaintain);
-    return this;
-  }
-
-  @Override
-  public int maxWriteBufferNumberToMaintain() {
-    return maxWriteBufferNumberToMaintain(nativeHandle_);
-  }
-
-  @Override
   public ColumnFamilyOptions setCompactionPriority(
       final CompactionPriority compactionPriority) {
     setCompactionPriority(nativeHandle_, compactionPriority.getValue());
@@ -1204,11 +1191,10 @@ public class ColumnFamilyOptions
   }
 
   /**
-   *  If the ratio of garbage in the oldest blob files exceeds this threshold,
-   *  targeted compactions are scheduled in order to force garbage collecting
-   *  the blob files in question, assuming they are all eligible based on the
-   *  value of {@link #blobGarbageCollectionAgeCutoff} above. This option is
-   *  currently only supported with leveled compactions.
+   * If the ratio of garbage in the blob files currently eligible for garbage
+   * collection exceeds this threshold, targeted compactions are scheduled in
+   * order to force garbage collecting the oldest blob files. This option is
+   * currently only supported with leveled compactions.
    * <p>
    *  Note that {@link #enableBlobGarbageCollection} has to be set in order for this
    *  option to have any effect.
@@ -1468,9 +1454,6 @@ public class ColumnFamilyOptions
   private static native int[] maxBytesForLevelMultiplierAdditional(long handle);
   private static native void setParanoidFileChecks(long handle, boolean paranoidFileChecks);
   private static native boolean paranoidFileChecks(long handle);
-  private static native void setMaxWriteBufferNumberToMaintain(
-      final long handle, final int maxWriteBufferNumberToMaintain);
-  private static native int maxWriteBufferNumberToMaintain(final long handle);
   private static native void setCompactionPriority(
       final long handle, final byte compactionPriority);
   private static native byte compactionPriority(final long handle);

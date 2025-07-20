@@ -25,13 +25,112 @@ namespace ROCKSDB_NAMESPACE {
 class Directories;
 class SystemClock;
 
-struct IngestedFileInfo {
+struct KeyRangeInfo {
+  // Smallest internal key in an external file or for a batch of external files.
+  // unset() could be either invalid or "before all keys"
+  InternalKey smallest_internal_key;
+  // Largest internal key in an external file or for a batch of external files.
+  // unset() could be either invalid or "after all keys"
+  InternalKey largest_internal_key;
+
+  bool unset() const {
+    // Legal internal keys are at least 8 bytes.
+    return smallest_internal_key.unset() || largest_internal_key.unset();
+  }
+};
+
+// Helper class to apply SST file key range checks to the external files.
+// XXX: using sstableKeyCompare with user comparator on internal keys is
+// very broken
+class ExternalFileRangeChecker {
+ public:
+  explicit ExternalFileRangeChecker(const Comparator* ucmp) : ucmp_(ucmp) {}
+
+  // Operator used for sorting ranges.
+  bool operator()(const KeyRangeInfo* range1,
+                  const KeyRangeInfo* range2) const {
+    assert(range1);
+    assert(range2);
+    assert(!range1->unset());
+    assert(!range2->unset());
+    return sstableKeyCompare(ucmp_, range1->smallest_internal_key,
+                             range2->smallest_internal_key) < 0;
+  }
+
+  bool Overlaps(const KeyRangeInfo& range1, const KeyRangeInfo& range2,
+                bool known_sorted = false) const {
+    return Overlaps(range1, range2.smallest_internal_key,
+                    range2.largest_internal_key, known_sorted);
+  }
+  bool Overlaps(const KeyRangeInfo& range1, const InternalKey& range2_smallest,
+                const InternalKey& range2_largest,
+                bool known_sorted = false) const {
+    bool any_unset =
+        range1.unset() || range2_smallest.unset() || range2_largest.unset();
+    if (any_unset) {
+      assert(!any_unset);
+      return false;
+    }
+    if (known_sorted) {
+      return sstableKeyCompare(ucmp_, range1.largest_internal_key,
+                               range2_smallest) >= 0;
+    }
+
+    return sstableKeyCompare(ucmp_, range1.largest_internal_key,
+                             range2_smallest) >= 0 &&
+           sstableKeyCompare(ucmp_, range1.smallest_internal_key,
+                             range2_largest) <= 0;
+  }
+
+  bool Contains(const KeyRangeInfo& range1, const KeyRangeInfo& range2) {
+    return Contains(range1, range2.smallest_internal_key,
+                    range2.largest_internal_key);
+  }
+  bool Contains(const KeyRangeInfo& range1, const InternalKey& range2_smallest,
+                const InternalKey& range2_largest) {
+    bool any_unset =
+        range1.unset() || range2_smallest.unset() || range2_largest.unset();
+    if (any_unset) {
+      assert(!any_unset);
+      return false;
+    }
+    return sstableKeyCompare(ucmp_, range1.smallest_internal_key,
+                             range2_smallest) <= 0 &&
+           sstableKeyCompare(ucmp_, range1.largest_internal_key,
+                             range2_largest) >= 0;
+  }
+
+  void MaybeUpdateRange(const InternalKey& start_key,
+                        const InternalKey& end_key, KeyRangeInfo* range) const {
+    assert(range);
+    if (range->smallest_internal_key.size() == 0 ||
+        sstableKeyCompare(ucmp_, start_key, range->smallest_internal_key) < 0) {
+      range->smallest_internal_key = start_key;
+    }
+    if (range->largest_internal_key.size() == 0 ||
+        sstableKeyCompare(ucmp_, end_key, range->largest_internal_key) > 0) {
+      range->largest_internal_key = end_key;
+    }
+  }
+
+ private:
+  const Comparator* ucmp_;
+};
+
+struct IngestedFileInfo : public KeyRangeInfo {
   // External file path
   std::string external_file_path;
-  // Smallest internal key in external file
-  InternalKey smallest_internal_key;
-  // Largest internal key in external file
-  InternalKey largest_internal_key;
+  // NOTE: use below two fields for all `*Overlap*` types of checks instead of
+  // smallest_internal_key.user_key() and largest_internal_key.user_key().
+  // The smallest / largest user key contained in the file for key range checks.
+  // These could be different from smallest_internal_key.user_key(), and
+  // largest_internal_key.user_key() when user-defined timestamps are enabled,
+  // because the check is about making sure the user key without timestamps part
+  // does not overlap. To achieve that, the smallest user key will be updated
+  // with the maximum timestamp while the largest user key will be updated with
+  // the min timestamp. It's otherwise the same.
+  std::string start_ukey;
+  std::string limit_ukey;
   // Sequence number for keys in external file
   SequenceNumber original_seqno;
   // Offset of the global sequence number field in the file, will
@@ -83,6 +182,30 @@ struct IngestedFileInfo {
   bool user_defined_timestamps_persisted = true;
 };
 
+// A batch of files.
+struct FileBatchInfo : public KeyRangeInfo {
+  autovector<IngestedFileInfo*> files;
+  // When true, `smallest_internal_key` and `largest_internal_key` will be
+  // tracked and updated as new file get added via `AddFile`. When false, we
+  // bypass this tracking. This is used when the all input external files
+  // are already checked and not overlapping, and they just need to be added
+  // into one default batch.
+  bool track_batch_range;
+
+  void AddFile(IngestedFileInfo* file,
+               const ExternalFileRangeChecker& key_range_checker) {
+    assert(file);
+    files.push_back(file);
+    if (track_batch_range) {
+      key_range_checker.MaybeUpdateRange(file->smallest_internal_key,
+                                         file->largest_internal_key, this);
+    }
+  }
+
+  explicit FileBatchInfo(bool _track_batch_range)
+      : track_batch_range(_track_batch_range) {}
+};
+
 class ExternalSstFileIngestionJob {
  public:
   ExternalSstFileIngestionJob(
@@ -97,6 +220,8 @@ class ExternalSstFileIngestionJob {
         fs_(db_options.fs, io_tracer),
         versions_(versions),
         cfd_(cfd),
+        ucmp_(cfd ? cfd->user_comparator() : nullptr),
+        file_range_checker_(ucmp_),
         db_options_(db_options),
         mutable_db_options_(mutable_db_options),
         env_options_(env_options),
@@ -108,14 +233,19 @@ class ExternalSstFileIngestionJob {
         consumed_seqno_count_(0),
         io_tracer_(io_tracer) {
     assert(directories != nullptr);
+    assert(cfd_);
+    assert(ucmp_);
   }
 
   ~ExternalSstFileIngestionJob() { UnregisterRange(); }
+
+  ColumnFamilyData* GetColumnFamilyData() const { return cfd_; }
 
   // Prepare the job by copying external files into the DB.
   Status Prepare(const std::vector<std::string>& external_files_paths,
                  const std::vector<std::string>& files_checksums,
                  const std::vector<std::string>& files_checksum_func_names,
+                 const std::optional<RangeOpt>& atomic_replace_range,
                  const Temperature& file_temperature, uint64_t next_file_number,
                  SuperVersion* sv);
 
@@ -128,6 +258,8 @@ class ExternalSstFileIngestionJob {
   //
   // Thread-safe
   Status NeedsFlush(bool* flush_needed, SuperVersion* super_version);
+
+  void SetFlushedBeforeRun() { flushed_before_run_ = true; }
 
   // Will execute the ingestion job and prepare edit() to be applied.
   // REQUIRES: Mutex held
@@ -183,15 +315,38 @@ class ExternalSstFileIngestionJob {
                              IngestedFileInfo* file_to_ingest,
                              SuperVersion* sv);
 
+  // If the input files' key range overlaps themselves, this function divides
+  // them in the user specified order into multiple batches. Where the files
+  // within a batch do not overlap with each other, but key range could overlap
+  // between batches.
+  // If the input files' key range don't overlap themselves, they always just
+  // make one batch.
+  void DivideInputFilesIntoBatches();
+
+  // Assign level for the files in one batch. The files within one batch are not
+  // overlapping, and we assign level to each file one after another.
+  // If `prev_batch_uppermost_level` is specified, all files in this batch will
+  // be assigned to levels that are higher than `prev_batch_uppermost_level`.
+  // The uppermost level used by this batch of files is tracked too, so that it
+  // can be used by the next batch.
+  // REQUIRES: Mutex held
+  Status AssignLevelsForOneBatch(FileBatchInfo& batch,
+                                 SuperVersion* super_version,
+                                 bool force_global_seqno,
+                                 SequenceNumber* last_seqno,
+                                 int* batch_uppermost_level,
+                                 std::optional<int> prev_batch_uppermost_level);
+
   // Assign `file_to_ingest` the appropriate sequence number and the lowest
   // possible level that it can be ingested to according to compaction_style.
+  // If `prev_batch_uppermost_level` is specified, the file will only be
+  // assigned to levels tha are higher than `prev_batch_uppermost_level`.
   // REQUIRES: Mutex held
-  Status AssignLevelAndSeqnoForIngestedFile(SuperVersion* sv,
-                                            bool force_global_seqno,
-                                            CompactionStyle compaction_style,
-                                            SequenceNumber last_seqno,
-                                            IngestedFileInfo* file_to_ingest,
-                                            SequenceNumber* assigned_seqno);
+  Status AssignLevelAndSeqnoForIngestedFile(
+      SuperVersion* sv, bool force_global_seqno,
+      CompactionStyle compaction_style, SequenceNumber last_seqno,
+      IngestedFileInfo* file_to_ingest, SequenceNumber* assigned_seqno,
+      std::optional<int> prev_batch_uppermost_level);
 
   // File that we want to ingest behind always goes to the lowest level;
   // we just check that it fits in the level, that DB allows ingest_behind,
@@ -226,12 +381,16 @@ class ExternalSstFileIngestionJob {
   FileSystemPtr fs_;
   VersionSet* versions_;
   ColumnFamilyData* cfd_;
+  const Comparator* ucmp_;
+  ExternalFileRangeChecker file_range_checker_;
   const ImmutableDBOptions& db_options_;
   const MutableDBOptions& mutable_db_options_;
   const EnvOptions& env_options_;
   SnapshotList* db_snapshots_;
   autovector<IngestedFileInfo> files_to_ingest_;
+  std::vector<FileBatchInfo> file_batches_to_ingest_;
   const IngestExternalFileOptions& ingestion_options_;
+  std::optional<KeyRangeInfo> atomic_replace_range_;
   Directories* directories_;
   EventLogger* event_logger_;
   VersionEdit edit_;
@@ -244,6 +403,10 @@ class ExternalSstFileIngestionJob {
   // file_checksum_gen_factory is set, DB will generate checksum each file.
   bool need_generate_file_checksum_{true};
   std::shared_ptr<IOTracer> io_tracer_;
+
+  // Flag indicating whether the column family is flushed after `Prepare` and
+  // before `Run`.
+  bool flushed_before_run_{false};
 
   // Below are variables used in (un)registering range for this ingestion job
   //

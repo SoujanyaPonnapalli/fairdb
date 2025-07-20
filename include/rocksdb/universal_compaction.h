@@ -65,6 +65,36 @@ class CompactionOptionsUniversal {
   // Default: -1
   int compression_size_percent;
 
+  // The limit on the number of sorted runs. RocksDB will try to keep
+  // the number of sorted runs at most this number. While compactions are
+  // running, the number of sorted runs may be temporarily higher than
+  // this number.
+  //
+  // Since universal compaction checks if there is compaction to do when
+  // the number of sorted runs is at least level0_file_num_compaction_trigger,
+  // it is suggested to set level0_file_num_compaction_trigger to be no larger
+  // than max_read_amp.
+  //
+  // Values:
+  // -1: special flag to let RocksDB pick default. Currently,
+  //  RocksDB will fall back to the behavior before this option is introduced,
+  //  which is to use level0_file_num_compaction_trigger as the limit.
+  //  This may change in the future to behave as 0 below.
+  // 0: Let RocksDB auto-tune. Currently, we determine the max number of
+  //  sorted runs based on the current DB size, size_ratio and
+  //  write_buffer_size. Note that this is only supported for the default
+  //  stop_style kCompactionStopStyleTotalSize. For
+  //  kCompactionStopStyleSimilarSize, this behaves as if -1 is configured.
+  // N > 0: limit the number of sorted runs to be at most N.
+  //  N should be at least the compaction trigger specified by
+  //  level0_file_num_compaction_trigger. If 0 < max_read_amp <
+  //  level0_file_num_compaction_trigger, Status::NotSupported() will be
+  //  returned during DB open.
+  // N < -1: Status::NotSupported() will be returned during DB open.
+  //
+  // Default: -1
+  int max_read_amp;
+
   // The algorithm used to stop picking files into a single compaction run
   // Default: kCompactionStopStyleTotalSize
   CompactionStopStyle stop_style;
@@ -81,6 +111,26 @@ class CompactionOptionsUniversal {
   // Default: false
   bool incremental;
 
+  // EXPERIMENTAL
+  //
+  // If true, auto universal compaction picking will adjust to minimize locking
+  // of input files when bottom priority compactions are waiting to run. This
+  // can increase the likelihood of existing L0s being selected for compaction,
+  // thereby improving write stall and reducing read regression. It may increase
+  // the overrall write amplification and compaction load on low priority
+  // threads.
+  //
+  // Default: false (disabled)
+  //
+  // This options does not apply to manual compactions.
+  //
+  // This option is temporary in case turning on this feature causes problems
+  // and users need to undo it quickly. This option is planned for removal in
+  // the near future with default value set to true.
+  //
+  // Dynamically changeable through the SetOptions() API.
+  bool reduce_file_locking;
+
   // Default set of parameters
   CompactionOptionsUniversal()
       : size_ratio(1),
@@ -88,9 +138,15 @@ class CompactionOptionsUniversal {
         max_merge_width(UINT_MAX),
         max_size_amplification_percent(200),
         compression_size_percent(-1),
+        max_read_amp(-1),
         stop_style(kCompactionStopStyleTotalSize),
         allow_trivial_move(false),
-        incremental(false) {}
+        incremental(false),
+        reduce_file_locking(false) {}
+
+#if __cplusplus >= 202002L
+  bool operator==(const CompactionOptionsUniversal& rhs) const = default;
+#endif
 };
 
 }  // namespace ROCKSDB_NAMESPACE

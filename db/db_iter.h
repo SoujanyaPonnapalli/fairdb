@@ -12,7 +12,6 @@
 #include <string>
 
 #include "db/db_impl/db_impl.h"
-#include "db/range_del_aggregator.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -57,6 +56,34 @@ class Version;
 // numbers, deletion markers, overwrites, etc.
 class DBIter final : public Iterator {
  public:
+  // Return a new DBIter that reads from `internal_iter` at the specified
+  // `sequence` number.
+  //
+  // @param active_mem Pointer to the active memtable that `internal_iter`
+  // is reading from. If not null, the memtable can be marked for flush
+  // according to options mutable_cf_options.memtable_op_scan_flush_trigger
+  // and mutable_cf_options.memtable_avg_op_scan_flush_trigger.
+  // @param arena_mode If true, the DBIter will be allocated from the arena.
+  static DBIter* NewIter(Env* env, const ReadOptions& read_options,
+                         const ImmutableOptions& ioptions,
+                         const MutableCFOptions& mutable_cf_options,
+                         const Comparator* user_key_comparator,
+                         InternalIterator* internal_iter,
+                         const Version* version, const SequenceNumber& sequence,
+                         ReadCallback* read_callback,
+                         ReadOnlyMemTable* active_mem,
+                         ColumnFamilyHandleImpl* cfh = nullptr,
+                         bool expose_blob_index = false,
+                         Arena* arena = nullptr) {
+    void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
+                      : operator new(sizeof(DBIter));
+    DBIter* db_iter = new (mem)
+        DBIter(env, read_options, ioptions, mutable_cf_options,
+               user_key_comparator, internal_iter, version, sequence, arena,
+               read_callback, cfh, expose_blob_index, active_mem);
+    return db_iter;
+  }
+
   // The following is grossly complicated. TODO: clean it up
   // Which direction is the iterator currently moving?
   // (1) When moving forward:
@@ -113,19 +140,12 @@ class DBIter final : public Iterator {
     uint64_t skip_count_;
   };
 
-  DBIter(Env* _env, const ReadOptions& read_options,
-         const ImmutableOptions& ioptions,
-         const MutableCFOptions& mutable_cf_options, const Comparator* cmp,
-         InternalIterator* iter, const Version* version, SequenceNumber s,
-         bool arena_mode, uint64_t max_sequential_skip_in_iterations,
-         ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
-         bool expose_blob_index);
-
   // No copying allowed
   DBIter(const DBIter&) = delete;
   void operator=(const DBIter&) = delete;
 
   ~DBIter() override {
+    MarkMemtableForFlushForAvgTrigger();
     ThreadStatus::OperationType cur_op_type =
         ThreadStatusUtil::GetThreadOperation();
     ThreadStatusUtil::SetThreadOperation(
@@ -218,7 +238,53 @@ class DBIter final : public Iterator {
   }
   void set_valid(bool v) { valid_ = v; }
 
+  bool PrepareValue() override;
+
+  void Prepare(const std::vector<ScanOptions>& scan_opts) override {
+    std::optional<std::vector<ScanOptions>> new_scan_opts;
+    new_scan_opts.emplace(scan_opts);
+    scan_opts_.swap(new_scan_opts);
+    if (!scan_opts.empty()) {
+      iter_.Prepare(&scan_opts_.value());
+    } else {
+      iter_.Prepare(nullptr);
+    }
+  }
+
  private:
+  DBIter(Env* _env, const ReadOptions& read_options,
+         const ImmutableOptions& ioptions,
+         const MutableCFOptions& mutable_cf_options, const Comparator* cmp,
+         InternalIterator* iter, const Version* version, SequenceNumber s,
+         bool arena_mode, ReadCallback* read_callback,
+         ColumnFamilyHandleImpl* cfh, bool expose_blob_index,
+         ReadOnlyMemTable* active_mem);
+
+  class BlobReader {
+   public:
+    BlobReader(const Version* version, ReadTier read_tier,
+               bool verify_checksums, bool fill_cache,
+               Env::IOActivity io_activity)
+        : version_(version),
+          read_tier_(read_tier),
+          verify_checksums_(verify_checksums),
+          fill_cache_(fill_cache),
+          io_activity_(io_activity) {}
+
+    const Slice& GetBlobValue() const { return blob_value_; }
+    Status RetrieveAndSetBlobValue(const Slice& user_key,
+                                   const Slice& blob_index);
+    void ResetBlobValue() { blob_value_.Reset(); }
+
+   private:
+    PinnableSlice blob_value_;
+    const Version* version_;
+    ReadTier read_tier_;
+    bool verify_checksums_;
+    bool fill_cache_;
+    Env::IOActivity io_activity_;
+  };
+
   // For all methods in this block:
   // PRE: iter_->Valid() && status_.ok()
   // Return false if there was an error, and status() is non-ok, valid_ = false;
@@ -299,15 +365,6 @@ class DBIter final : public Iterator {
                : user_comparator_.CompareWithoutTimestamp(a, b);
   }
 
-  // Retrieves the blob value for the specified user key using the given blob
-  // index when using the integrated BlobDB implementation.
-  bool SetBlobValueIfNeeded(const Slice& user_key, const Slice& blob_index);
-
-  void ResetBlobValue() {
-    is_blob_ = false;
-    blob_value_.Reset();
-  }
-
   void SetValueAndColumnsFromPlain(const Slice& slice) {
     assert(value_.empty());
     assert(wide_columns_.empty());
@@ -315,6 +372,11 @@ class DBIter final : public Iterator {
     value_ = slice;
     wide_columns_.emplace_back(kDefaultWideColumnName, slice);
   }
+
+  bool SetValueAndColumnsFromBlobImpl(const Slice& user_key,
+                                      const Slice& blob_index);
+  bool SetValueAndColumnsFromBlob(const Slice& user_key,
+                                  const Slice& blob_index);
 
   bool SetValueAndColumnsFromEntity(Slice slice);
 
@@ -326,14 +388,21 @@ class DBIter final : public Iterator {
     wide_columns_.clear();
   }
 
+  void ResetBlobData() {
+    blob_reader_.ResetBlobValue();
+    lazy_blob_index_.clear();
+    is_blob_ = false;
+  }
+
   // The following methods perform the actual merge operation for the
-  // no base value/plain base value/wide-column base value cases.
+  // no/plain/blob/wide-column base value cases.
   // If user-defined timestamp is enabled, `user_key` includes timestamp.
   bool MergeWithNoBaseValue(const Slice& user_key);
   bool MergeWithPlainBaseValue(const Slice& value, const Slice& user_key);
+  bool MergeWithBlobBaseValue(const Slice& blob_index, const Slice& user_key);
   bool MergeWithWideColumnBaseValue(const Slice& entity, const Slice& user_key);
 
-  bool PrepareValue() {
+  bool PrepareValueInternal() {
     if (!iter_.PrepareValue()) {
       assert(!iter_.status().ok());
       valid_ = false;
@@ -349,6 +418,36 @@ class DBIter final : public Iterator {
     return true;
   }
 
+  void MarkMemtableForFlushForAvgTrigger() {
+    if (avg_op_scan_flush_trigger_ &&
+        mem_hidden_op_scanned_since_seek_ >= memtable_op_scan_flush_trigger_ &&
+        mem_hidden_op_scanned_since_seek_ >=
+            static_cast<uint64_t>(iter_step_since_seek_) *
+                avg_op_scan_flush_trigger_) {
+      assert(memtable_op_scan_flush_trigger_ > 0);
+      active_mem_->MarkForFlush();
+      avg_op_scan_flush_trigger_ = 0;
+      memtable_op_scan_flush_trigger_ = 0;
+    }
+    iter_step_since_seek_ = 1;
+    mem_hidden_op_scanned_since_seek_ = 0;
+  }
+
+  void MarkMemtableForFlushForPerOpTrigger(uint64_t& mem_hidden_op_scanned) {
+    if (memtable_op_scan_flush_trigger_ &&
+        ikey_.sequence >= memtable_seqno_lb_) {
+      if (++mem_hidden_op_scanned >= memtable_op_scan_flush_trigger_) {
+        active_mem_->MarkForFlush();
+        // Turn off the flush trigger checks.
+        memtable_op_scan_flush_trigger_ = 0;
+        avg_op_scan_flush_trigger_ = 0;
+      }
+      if (avg_op_scan_flush_trigger_) {
+        ++mem_hidden_op_scanned_since_seek_;
+      }
+    }
+  }
+
   const SliceTransform* prefix_extractor_;
   Env* const env_;
   SystemClock* clock_;
@@ -356,7 +455,7 @@ class DBIter final : public Iterator {
   UserComparatorWrapper user_comparator_;
   const MergeOperator* const merge_operator_;
   IteratorWrapper iter_;
-  const Version* version_;
+  BlobReader blob_reader_;
   ReadCallback* read_callback_;
   // Max visible sequence number. It is normally the snapshot seq unless we have
   // uncommitted data in db as in WriteUnCommitted.
@@ -368,15 +467,14 @@ class DBIter final : public Iterator {
   // overhead of calling construction of the function if creating it each time.
   ParsedInternalKey ikey_;
 
-  // TODO(yuzhangyu): update this documentation for kTypeValuePreferredSeqno
-  // types.
   // The approximate write time for the entry. It is deduced from the entry's
-  // sequence number if the seqno to time mapping is available.
+  // sequence number if the seqno to time mapping is available. For a
+  // kTypeValuePreferredSeqno entry, this is the write time specified by the
+  // user.
   uint64_t saved_write_unix_time_;
   std::string saved_value_;
   Slice pinned_value_;
   // for prefix seek mode to support prev()
-  PinnableSlice blob_value_;
   // Value of the default column
   Slice value_;
   // All columns (i.e. name-value pairs)
@@ -396,6 +494,24 @@ class DBIter final : public Iterator {
   IterKey prefix_;
 
   Status status_;
+  Slice lazy_blob_index_;
+
+  // List of operands for merge operator.
+  MergeContext merge_context_;
+  LocalStatistics local_stats_;
+  PinnedIteratorsManager pinned_iters_mgr_;
+  ColumnFamilyHandleImpl* cfh_;
+  const Slice* const timestamp_ub_;
+  const Slice* const timestamp_lb_;
+  const size_t timestamp_size_;
+  std::string saved_timestamp_;
+  std::optional<std::vector<ScanOptions>> scan_opts_;
+  ReadOnlyMemTable* const active_mem_;
+  SequenceNumber memtable_seqno_lb_;
+  uint32_t memtable_op_scan_flush_trigger_;
+  uint32_t avg_op_scan_flush_trigger_;
+  uint32_t iter_step_since_seek_;
+  uint32_t mem_hidden_op_scanned_since_seek_;
   Direction direction_;
   bool valid_;
   bool current_entry_is_merged_;
@@ -410,35 +526,11 @@ class DBIter final : public Iterator {
   // Expect the inner iterator to maintain a total order.
   // prefix_extractor_ must be non-NULL if the value is false.
   const bool expect_total_order_inner_iter_;
-  ReadTier read_tier_;
-  bool fill_cache_;
-  bool verify_checksums_;
   // Whether the iterator is allowed to expose blob references. Set to true when
   // the stacked BlobDB implementation is used, false otherwise.
   bool expose_blob_index_;
+  bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
-  const Env::IOActivity io_activity_;
-  // List of operands for merge operator.
-  MergeContext merge_context_;
-  LocalStatistics local_stats_;
-  PinnedIteratorsManager pinned_iters_mgr_;
-  ColumnFamilyHandleImpl* cfh_;
-  const Slice* const timestamp_ub_;
-  const Slice* const timestamp_lb_;
-  const size_t timestamp_size_;
-  std::string saved_timestamp_;
 };
-
-// Return a new iterator that converts internal keys (yielded by
-// "*internal_iter") that were live at the specified `sequence` number
-// into appropriate user keys.
-Iterator* NewDBIterator(
-    Env* env, const ReadOptions& read_options, const ImmutableOptions& ioptions,
-    const MutableCFOptions& mutable_cf_options,
-    const Comparator* user_key_comparator, InternalIterator* internal_iter,
-    const Version* version, const SequenceNumber& sequence,
-    uint64_t max_sequential_skip_in_iterations, ReadCallback* read_callback,
-    ColumnFamilyHandleImpl* cfh = nullptr, bool expose_blob_index = false);
-
 }  // namespace ROCKSDB_NAMESPACE

@@ -475,6 +475,12 @@ class LRUCache
     return miss_ctr_;
   }
 
+  void ApplyToHandle(
+      Cache* cache, Handle* handle,
+      const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
+                               const CacheItemHelper* helper)>& callback)
+      override;
+
   // Retrieves number of elements in LRU, for unit test purpose only.
   size_t TEST_GetLRUSize();
   // Retrieves high pri pool ratio.

@@ -172,7 +172,8 @@ Status SstFileDumper::NewTableReader(
     const InternalKeyComparator& /*internal_comparator*/, uint64_t file_size,
     std::unique_ptr<TableReader>* /*table_reader*/) {
   auto t_opt = TableReaderOptions(
-      ioptions_, moptions_.prefix_extractor, soptions_, internal_comparator_,
+      ioptions_, moptions_.prefix_extractor,
+      moptions_.compression_manager.get(), soptions_, internal_comparator_,
       0 /* block_protection_bytes_per_key */, false /* skip_filters */,
       false /* immortal */, true /* force_direct_prefetch */, -1 /* level */,
       nullptr /* block_cache_tracer */, 0 /* max_file_size_for_l0_meta_pin */,
@@ -311,7 +312,7 @@ Status SstFileDumper::ShowCompressionSize(
       imoptions, moptions, read_options, write_options, ikc,
       &block_based_table_factories, compress_type, compress_opt,
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
-      column_family_name, unknown_level);
+      column_family_name, unknown_level, kUnknownNewestKeyTime);
   uint64_t num_data_blocks = 0;
   std::chrono::steady_clock::time_point start =
       std::chrono::steady_clock::now();
@@ -474,12 +475,11 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num_limit,
   const Comparator* ucmp = internal_comparator_.user_comparator();
   size_t ts_sz = ucmp->timestamp_size();
 
-  Slice from_slice = from_key;
-  Slice to_slice = to_key;
+  OptSlice from_opt = has_from ? from_key : OptSlice{};
+  OptSlice to_opt = has_to ? to_key : OptSlice{};
   std::string from_key_buf, to_key_buf;
-  auto [from, to] = MaybeAddTimestampsToRange(
-      has_from ? &from_slice : nullptr, has_to ? &to_slice : nullptr, ts_sz,
-      &from_key_buf, &to_key_buf);
+  auto [from, to] = MaybeAddTimestampsToRange(from_opt, to_opt, ts_sz,
+                                              &from_key_buf, &to_key_buf);
   uint64_t i = 0;
   if (from.has_value()) {
     InternalKey ikey;
@@ -521,22 +521,22 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num_limit,
               iter->value(), oss, output_hex_);
           if (!s.ok()) {
             fprintf(stderr, "%s => error deserializing wide columns\n",
-                    ikey.DebugString(true, output_hex_).c_str());
+                    ikey.DebugString(true, output_hex_, ucmp).c_str());
             continue;
           }
           fprintf(stdout, "%s => %s\n",
-                  ikey.DebugString(true, output_hex_).c_str(),
+                  ikey.DebugString(true, output_hex_, ucmp).c_str(),
                   oss.str().c_str());
         } else if (ikey.type == kTypeValuePreferredSeqno) {
           auto [unpacked_value, preferred_seqno] =
               ParsePackedValueWithSeqno(value);
           fprintf(stdout, "%s => %s, %llu\n",
-                  ikey.DebugString(true, output_hex_).c_str(),
+                  ikey.DebugString(true, output_hex_, ucmp).c_str(),
                   unpacked_value.ToString(output_hex_).c_str(),
                   static_cast<unsigned long long>(preferred_seqno));
         } else {
           fprintf(stdout, "%s => %s\n",
-                  ikey.DebugString(true, output_hex_).c_str(),
+                  ikey.DebugString(true, output_hex_, ucmp).c_str(),
                   value.ToString(output_hex_).c_str());
         }
       } else {
@@ -545,12 +545,12 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num_limit,
         const Status s = blob_index.DecodeFrom(value);
         if (!s.ok()) {
           fprintf(stderr, "%s => error decoding blob index\n",
-                  ikey.DebugString(true, output_hex_).c_str());
+                  ikey.DebugString(true, output_hex_, ucmp).c_str());
           continue;
         }
 
         fprintf(stdout, "%s => %s\n",
-                ikey.DebugString(true, output_hex_).c_str(),
+                ikey.DebugString(true, output_hex_, ucmp).c_str(),
                 blob_index.DebugString(output_hex_).c_str());
       }
     }

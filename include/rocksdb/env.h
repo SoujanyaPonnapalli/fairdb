@@ -30,6 +30,7 @@
 #include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 #include "rocksdb/thread_status.h"
+#include "rocksdb/types.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -133,9 +134,6 @@ struct EnvOptions {
   size_t compaction_readahead_size = 0;
 
   // See DBOptions doc
-  size_t random_access_max_buffer_size = 0;
-
-  // See DBOptions doc
   size_t writable_file_max_buffer_size = 1024 * 1024;
 
   // If not nullptr, write rate limiting is enabled for flush and compaction
@@ -145,6 +143,11 @@ struct EnvOptions {
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
+// An interface that abstracts RocksDB's interactions with the operating system
+// environment. There are three main types of APIs:
+// 1) File system operations, like creating a file, writing to a file, etc.
+// 2) Thread management.
+// 3) Misc functions, like getting the current time.
 class Env : public Customizable {
  public:
   static const char* kDefaultName() { return "DefaultEnv"; }
@@ -154,6 +157,9 @@ class Env : public Customizable {
 
     // Size of file in bytes
     uint64_t size_bytes;
+
+    // EXPERIMENTAL - only provided by some implementations
+    Temperature temperature = Temperature::kUnknown;
   };
 
   Env();
@@ -449,8 +455,11 @@ class Env : public Customizable {
     kVerifyFileChecksums = 7,
     kGetEntity = 8,
     kMultiGetEntity = 9,
+    kGetFileChecksumsFromCurrentManifest = 10,
     kUnknown,  // Keep last for easy array of non-unknowns
   };
+
+  static std::string IOActivityToString(IOActivity activity);
 
   // Arrange to run "(*function)(arg)" once in a background thread, in
   // the thread pool specified by pri. By default, jobs go to the 'LOW'
@@ -620,7 +629,7 @@ class Env : public Customizable {
       const EnvOptions& env_options,
       const ImmutableDBOptions& immutable_ops) const;
 
-  // OptimizeForCompactionTableWrite will create a new EnvOptions object that
+  // OptimizeForCompactionTableRead will create a new EnvOptions object that
   // is a copy of the EnvOptions in the parameters, but is optimized for reading
   // table files.
   virtual EnvOptions OptimizeForCompactionTableRead(
@@ -1208,6 +1217,10 @@ enum InfoLogLevel : unsigned char {
 class Logger {
  public:
   static constexpr size_t kDoNotSupportGetLogFileSize = SIZE_MAX;
+
+  // Set to INFO_LEVEL when RocksDB is compiled in release mode, and
+  // DEBUG_LEVEL when compiled in debug mode. See DBOptions::info_log_level.
+  static const InfoLogLevel kDefaultLogLevel;
 
   explicit Logger(const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL)
       : closed_(false), log_level_(log_level) {}

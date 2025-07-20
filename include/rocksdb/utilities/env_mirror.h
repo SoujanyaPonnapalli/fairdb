@@ -18,7 +18,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <iostream>
 #include <vector>
@@ -83,7 +82,7 @@ class EnvMirror : public EnvWrapper {
     std::sort(ar.begin(), ar.end());
     std::sort(br.begin(), br.end());
     if (!as.ok() || ar != br) {
-      assert(0 == "getchildren results don't match");
+      assert(nullptr == "getchildren results don't match");
     }
     *r = ar;
     return as;
@@ -176,4 +175,3 @@ class EnvMirror : public EnvWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/blob_db/blob_db.h"
 
 #include <algorithm>
@@ -234,7 +233,7 @@ class BlobDBTest : public testing::Test {
     DB *db = blob_db_->GetRootDB();
     const size_t kMaxKeys = 10000;
     std::vector<KeyVersion> versions;
-    ASSERT_OK(GetAllKeyVersions(db, "", "", kMaxKeys, &versions));
+    ASSERT_OK(GetAllKeyVersions(db, {}, {}, kMaxKeys, &versions));
     ASSERT_EQ(expected_versions.size(), versions.size());
     size_t i = 0;
     for (auto &key_version : expected_versions) {
@@ -260,7 +259,7 @@ class BlobDBTest : public testing::Test {
     const size_t kMaxKeys = 10000;
     std::vector<KeyVersion> versions;
     ASSERT_OK(
-        GetAllKeyVersions(blob_db_->GetRootDB(), "", "", kMaxKeys, &versions));
+        GetAllKeyVersions(blob_db_->GetRootDB(), {}, {}, kMaxKeys, &versions));
     ASSERT_EQ(versions.size(), expected_versions.size());
 
     size_t i = 0;
@@ -760,7 +759,7 @@ TEST_F(BlobDBTest, SstFileManager) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 
@@ -818,7 +817,7 @@ TEST_F(BlobDBTest, SstFileManagerRestart) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 
@@ -1013,6 +1012,27 @@ TEST_F(BlobDBTest, GetLiveFilesMetaData) {
   ASSERT_EQ(5U, livefile.size());
   ASSERT_EQ(filename1, livefile[3]);
   ASSERT_EQ(filename2, livefile[4]);
+
+  std::vector<LiveFileStorageInfo> all_files, blob_files;
+  ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
+                                              &all_files));
+  for (size_t i = 0; i < all_files.size(); i++) {
+    if (all_files[i].file_type == kBlobFile) {
+      blob_files.push_back(all_files[i]);
+    }
+  }
+
+  ASSERT_EQ(2U, blob_files.size());
+  ASSERT_GT(all_files.size(), blob_files.size());
+
+  ASSERT_EQ("000001.blob", blob_files[0].relative_filename);
+  ASSERT_EQ(blob_db_impl()->TEST_blob_dir(), blob_files[0].directory);
+  ASSERT_GT(blob_files[0].size, 0);
+
+  ASSERT_EQ("000002.blob", blob_files[1].relative_filename);
+  ASSERT_EQ(blob_db_impl()->TEST_blob_dir(), blob_files[1].directory);
+  ASSERT_GT(blob_files[1].size, 0);
+
   VerifyDB(data);
 }
 
@@ -1575,7 +1595,7 @@ TEST_F(BlobDBTest, FilterExpiredBlobIndex) {
   // Verify expired blob index are filtered.
   std::vector<KeyVersion> versions;
   const size_t kMaxKeys = 10000;
-  ASSERT_OK(GetAllKeyVersions(blob_db_, "", "", kMaxKeys, &versions));
+  ASSERT_OK(GetAllKeyVersions(blob_db_, {}, {}, kMaxKeys, &versions));
   ASSERT_EQ(data_after_compact.size(), versions.size());
   for (auto &version : versions) {
     ASSERT_TRUE(data_after_compact.count(version.user_key) > 0);
@@ -1609,14 +1629,14 @@ TEST_F(BlobDBTest, FilterFileNotAvailable) {
 
   DB *base_db = blob_db_->GetRootDB();
   std::vector<KeyVersion> versions;
-  ASSERT_OK(GetAllKeyVersions(base_db, "", "", kMaxKeys, &versions));
+  ASSERT_OK(GetAllKeyVersions(base_db, {}, {}, kMaxKeys, &versions));
   ASSERT_EQ(2, versions.size());
   ASSERT_EQ("bar", versions[0].user_key);
   ASSERT_EQ("foo", versions[1].user_key);
   VerifyDB({{"bar", "v2"}, {"foo", "v1"}});
 
   ASSERT_OK(blob_db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  ASSERT_OK(GetAllKeyVersions(base_db, "", "", kMaxKeys, &versions));
+  ASSERT_OK(GetAllKeyVersions(base_db, {}, {}, kMaxKeys, &versions));
   ASSERT_EQ(2, versions.size());
   ASSERT_EQ("bar", versions[0].user_key);
   ASSERT_EQ("foo", versions[1].user_key);
@@ -1626,7 +1646,7 @@ TEST_F(BlobDBTest, FilterFileNotAvailable) {
   blob_db_impl()->TEST_ObsoleteBlobFile(blob_files[0]);
   blob_db_impl()->TEST_DeleteObsoleteFiles();
   ASSERT_OK(blob_db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  ASSERT_OK(GetAllKeyVersions(base_db, "", "", kMaxKeys, &versions));
+  ASSERT_OK(GetAllKeyVersions(base_db, {}, {}, kMaxKeys, &versions));
   ASSERT_EQ(1, versions.size());
   ASSERT_EQ("bar", versions[0].user_key);
   VerifyDB({{"bar", "v2"}});
@@ -1635,7 +1655,7 @@ TEST_F(BlobDBTest, FilterFileNotAvailable) {
   blob_db_impl()->TEST_ObsoleteBlobFile(blob_files[1]);
   blob_db_impl()->TEST_DeleteObsoleteFiles();
   ASSERT_OK(blob_db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  ASSERT_OK(GetAllKeyVersions(base_db, "", "", kMaxKeys, &versions));
+  ASSERT_OK(GetAllKeyVersions(base_db, {}, {}, kMaxKeys, &versions));
   ASSERT_EQ(0, versions.size());
   VerifyDB({});
 }

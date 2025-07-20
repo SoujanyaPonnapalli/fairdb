@@ -77,13 +77,17 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
     TableFileCreationReason reason, const Status& s,
     const std::string& file_checksum,
     const std::string& file_checksum_func_name) {
-  if (s.ok() && event_logger) {
+  if (!event_logger && listeners.empty()) {
+    s.PermitUncheckedError();
+    return;
+  }
+
+  if (event_logger) {
     JSONWriter jwriter;
     AppendCurrentTime(&jwriter);
     jwriter << "cf_name" << cf_name << "job" << job_id << "event"
-            << "table_file_creation"
-            << "file_number" << fd.GetNumber() << "file_size"
-            << fd.GetFileSize() << "file_checksum"
+            << "table_file_creation" << "file_number" << fd.GetNumber()
+            << "file_size" << fd.GetFileSize() << "file_checksum"
             << Slice(file_checksum).ToString(true) << "file_checksum_func_name"
             << file_checksum_func_name << "smallest_seqno" << fd.smallest_seqno
             << "largest_seqno" << fd.largest_seqno;
@@ -124,6 +128,7 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
               << "comparator" << table_properties.comparator_name
               << "user_defined_timestamps_persisted"
               << table_properties.user_defined_timestamps_persisted
+              << "key_largest_seqno" << table_properties.key_largest_seqno
               << "merge_operator" << table_properties.merge_operator_name
               << "prefix_extractor_name"
               << table_properties.prefix_extractor_name << "property_collectors"
@@ -131,6 +136,7 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
               << table_properties.compression_name << "compression_options"
               << table_properties.compression_options << "creation_time"
               << table_properties.creation_time << "oldest_key_time"
+              << table_properties.newest_key_time << "newest_key_time"
               << table_properties.oldest_key_time << "file_creation_time"
               << table_properties.file_creation_time
               << "slow_compression_estimated_data_size"
@@ -164,6 +170,8 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
       jwriter << "oldest_blob_file_number" << oldest_blob_file_number;
     }
 
+    jwriter << "status" << s.ToString();
+
     jwriter.EndObject();
 
     event_logger->Log(jwriter);
@@ -194,19 +202,22 @@ void EventHelpers::LogAndNotifyTableFileDeletion(
     const std::string& file_path, const Status& status,
     const std::string& dbname,
     const std::vector<std::shared_ptr<EventListener>>& listeners) {
-  JSONWriter jwriter;
-  AppendCurrentTime(&jwriter);
-
-  jwriter << "job" << job_id << "event"
-          << "table_file_deletion"
-          << "file_number" << file_number;
-  if (!status.ok()) {
-    jwriter << "status" << status.ToString();
+  if (!event_logger && listeners.empty()) {
+    status.PermitUncheckedError();
+    return;
   }
 
-  jwriter.EndObject();
+  if (event_logger) {
+    JSONWriter jwriter;
+    AppendCurrentTime(&jwriter);
 
-  event_logger->Log(jwriter);
+    jwriter << "job" << job_id << "event" << "table_file_deletion"
+            << "file_number" << file_number << "status" << status.ToString();
+
+    jwriter.EndObject();
+
+    event_logger->Log(jwriter);
+  }
 
   if (listeners.empty()) {
     return;
@@ -228,15 +239,18 @@ void EventHelpers::NotifyOnErrorRecoveryEnd(
     InstrumentedMutex* db_mutex) {
   if (!listeners.empty()) {
     db_mutex->AssertHeld();
+    // Make copies before releasing mutex to avoid race.
+    Status old_bg_error_cp = old_bg_error;
+    Status new_bg_error_cp = new_bg_error;
     // release lock while notifying events
     db_mutex->Unlock();
     TEST_SYNC_POINT("NotifyOnErrorRecoveryEnd:MutexUnlocked:1");
     TEST_SYNC_POINT("NotifyOnErrorRecoveryEnd:MutexUnlocked:2");
     for (auto& listener : listeners) {
       BackgroundErrorRecoveryInfo info;
-      info.old_bg_error = old_bg_error;
-      info.new_bg_error = new_bg_error;
-      listener->OnErrorRecoveryCompleted(old_bg_error);
+      info.old_bg_error = old_bg_error_cp;
+      info.new_bg_error = new_bg_error_cp;
+      listener->OnErrorRecoveryCompleted(old_bg_error_cp);
       listener->OnErrorRecoveryEnd(info);
       info.old_bg_error.PermitUncheckedError();
       info.new_bg_error.PermitUncheckedError();
@@ -271,15 +285,20 @@ void EventHelpers::LogAndNotifyBlobFileCreationFinished(
     const std::string& file_checksum,
     const std::string& file_checksum_func_name, uint64_t total_blob_count,
     uint64_t total_blob_bytes) {
-  if (s.ok() && event_logger) {
+  if (!event_logger && listeners.empty()) {
+    s.PermitUncheckedError();
+    return;
+  }
+
+  if (event_logger) {
     JSONWriter jwriter;
     AppendCurrentTime(&jwriter);
     jwriter << "cf_name" << cf_name << "job" << job_id << "event"
-            << "blob_file_creation"
-            << "file_number" << file_number << "total_blob_count"
-            << total_blob_count << "total_blob_bytes" << total_blob_bytes
-            << "file_checksum" << file_checksum << "file_checksum_func_name"
-            << file_checksum_func_name << "status" << s.ToString();
+            << "blob_file_creation" << "file_number" << file_number
+            << "total_blob_count" << total_blob_count << "total_blob_bytes"
+            << total_blob_bytes << "file_checksum" << file_checksum
+            << "file_checksum_func_name" << file_checksum_func_name << "status"
+            << s.ToString();
 
     jwriter.EndObject();
     event_logger->Log(jwriter);
@@ -302,16 +321,17 @@ void EventHelpers::LogAndNotifyBlobFileDeletion(
     const std::vector<std::shared_ptr<EventListener>>& listeners, int job_id,
     uint64_t file_number, const std::string& file_path, const Status& status,
     const std::string& dbname) {
+  if (!event_logger && listeners.empty()) {
+    status.PermitUncheckedError();
+    return;
+  }
+
   if (event_logger) {
     JSONWriter jwriter;
     AppendCurrentTime(&jwriter);
 
-    jwriter << "job" << job_id << "event"
-            << "blob_file_deletion"
-            << "file_number" << file_number;
-    if (!status.ok()) {
-      jwriter << "status" << status.ToString();
-    }
+    jwriter << "job" << job_id << "event" << "blob_file_deletion"
+            << "file_number" << file_number << "status" << status.ToString();
 
     jwriter.EndObject();
     event_logger->Log(jwriter);

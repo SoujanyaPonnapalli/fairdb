@@ -312,12 +312,12 @@ TEST_P(DbKvChecksumTest, WriteToWALCorrupted) {
     // Corrupted write batch leads to read-only mode, so we have to
     // reopen for every attempt.
     Reopen(options);
-    auto log_size_pre_write = dbfull()->TEST_total_log_size();
+    auto log_size_pre_write = dbfull()->TEST_wals_total_size();
 
     SyncPoint::GetInstance()->EnableProcessing();
     ASSERT_TRUE(ExecuteWrite(nullptr /* cf_handle */).IsCorruption());
     // Confirm that nothing was written to WAL
-    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_total_log_size());
+    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_wals_total_size());
     ASSERT_TRUE(dbfull()->TEST_GetBGError().IsCorruption());
     SyncPoint::GetInstance()->DisableProcessing();
 
@@ -350,12 +350,12 @@ TEST_P(DbKvChecksumTest, WriteToWALWithColumnFamilyCorrupted) {
     // Corrupted write batch leads to read-only mode, so we have to
     // reopen for every attempt.
     ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
-    auto log_size_pre_write = dbfull()->TEST_total_log_size();
+    auto log_size_pre_write = dbfull()->TEST_wals_total_size();
 
     SyncPoint::GetInstance()->EnableProcessing();
     ASSERT_TRUE(ExecuteWrite(nullptr /* cf_handle */).IsCorruption());
     // Confirm that nothing was written to WAL
-    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_total_log_size());
+    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_wals_total_size());
     ASSERT_TRUE(dbfull()->TEST_GetBGError().IsCorruption());
     SyncPoint::GetInstance()->DisableProcessing();
 
@@ -487,7 +487,7 @@ TEST_P(DbKvChecksumTestMergedBatch, WriteToWALCorrupted) {
     // Reopen DB since it failed WAL write which lead to read-only mode
     Reopen(options);
     SyncPoint::GetInstance()->EnableProcessing();
-    auto log_size_pre_write = dbfull()->TEST_total_log_size();
+    auto log_size_pre_write = dbfull()->TEST_wals_total_size();
     leader_batch_and_status =
         GetWriteBatch(GetCFHandleToUse(nullptr, op_type1_),
                       8 /* protection_bytes_per_key */, op_type1_);
@@ -499,7 +499,7 @@ TEST_P(DbKvChecksumTestMergedBatch, WriteToWALCorrupted) {
     SyncPoint::GetInstance()->ClearCallBack("WriteThread::JoinBatchGroup:Wait");
     ASSERT_EQ(1, leader_count);
     // Nothing should have been written to WAL
-    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_total_log_size());
+    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_wals_total_size());
     ASSERT_TRUE(dbfull()->TEST_GetBGError().IsCorruption());
 
     corrupt_byte_offset++;
@@ -599,7 +599,7 @@ TEST_P(DbKvChecksumTestMergedBatch, WriteToWALWithColumnFamilyCorrupted) {
     // Reopen DB since it failed WAL write which lead to read-only mode
     ReopenWithColumnFamilies({kDefaultColumnFamilyName, "ramen"}, options);
     SyncPoint::GetInstance()->EnableProcessing();
-    auto log_size_pre_write = dbfull()->TEST_total_log_size();
+    auto log_size_pre_write = dbfull()->TEST_wals_total_size();
     leader_batch_and_status =
         GetWriteBatch(GetCFHandleToUse(handles_[1], op_type1_),
                       8 /* protection_bytes_per_key */, op_type1_);
@@ -612,7 +612,7 @@ TEST_P(DbKvChecksumTestMergedBatch, WriteToWALWithColumnFamilyCorrupted) {
 
     ASSERT_EQ(1, leader_count);
     // Nothing should have been written to WAL
-    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_total_log_size());
+    ASSERT_EQ(log_size_pre_write, dbfull()->TEST_wals_total_size());
     ASSERT_TRUE(dbfull()->TEST_GetBGError().IsCorruption());
 
     corrupt_byte_offset++;
@@ -684,13 +684,14 @@ class DbMemtableKVChecksumTest : public DbKvChecksumTest {
   DbMemtableKVChecksumTest() : DbKvChecksumTest() {}
 
  protected:
+  const size_t kValueLenOffset = 12;
   // Indices in the memtable entry that we will not corrupt.
   // For memtable entry format, see comments in MemTable::Add().
   // We do not corrupt key length and value length fields in this test
   // case since it causes segfault and ASAN will complain.
   // For this test case, key and value are all of length 3, so
   // key length field is at index 0 and value length field is at index 12.
-  const std::set<size_t> index_not_to_corrupt{0, 12};
+  const std::set<size_t> index_not_to_corrupt{0, kValueLenOffset};
 
   void SkipNotToCorruptEntry() {
     if (index_not_to_corrupt.find(corrupt_byte_offset_) !=
@@ -732,11 +733,13 @@ TEST_P(DbMemtableKVChecksumTest, GetWithCorruptAfterMemtableInsert) {
       });
 
   SyncPoint::GetInstance()->SetCallBack(
-      "Memtable::SaveValue:Begin:entry", [&](void* entry) {
+      "Memtable::SaveValue:Found:entry", [&](void* entry) {
         char* buf = *static_cast<char**>(entry);
         buf[corrupt_byte_offset_] += corrupt_byte_addend_;
         ++corrupt_byte_offset_;
       });
+  // Corrupt value only so that MultiGet below can find the key.
+  corrupt_byte_offset_ = kValueLenOffset + 1;
   SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.memtable_protection_bytes_per_key =
@@ -745,12 +748,17 @@ TEST_P(DbMemtableKVChecksumTest, GetWithCorruptAfterMemtableInsert) {
     options.merge_operator = MergeOperators::CreateStringAppendOperator();
   }
 
+  std::string key = "key";
   SkipNotToCorruptEntry();
   while (MoreBytesToCorrupt()) {
     Reopen(options);
     ASSERT_OK(ExecuteWrite(nullptr));
     std::string val;
-    ASSERT_TRUE(db_->Get(ReadOptions(), "key", &val).IsCorruption());
+    ASSERT_TRUE(db_->Get(ReadOptions(), key, &val).IsCorruption());
+    std::vector<std::string> vals = {val};
+    std::vector<Status> statuses = db_->MultiGet(
+        ReadOptions(), {db_->DefaultColumnFamily()}, {key}, &vals, nullptr);
+    ASSERT_TRUE(statuses[0].IsCorruption());
     Destroy(options);
     SkipNotToCorruptEntry();
   }
@@ -769,7 +777,7 @@ TEST_P(DbMemtableKVChecksumTest,
       });
 
   SyncPoint::GetInstance()->SetCallBack(
-      "Memtable::SaveValue:Begin:entry", [&](void* entry) {
+      "Memtable::SaveValue:Found:entry", [&](void* entry) {
         char* buf = *static_cast<char**>(entry);
         buf[corrupt_byte_offset_] += corrupt_byte_addend_;
         ++corrupt_byte_offset_;

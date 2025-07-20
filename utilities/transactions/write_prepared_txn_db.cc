@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/write_prepared_txn_db.h"
 
 #include <algorithm>
@@ -213,8 +212,8 @@ Status WritePreparedTxnDB::WriteInternal(const WriteOptions& write_options_orig,
   } else {
     pre_release_callback = &add_prepared_callback;
   }
-  s = db_impl_->WriteImpl(write_options, batch, nullptr, nullptr, no_log_ref,
-                          !DISABLE_MEMTABLE, &seq_used, batch_cnt,
+  s = db_impl_->WriteImpl(write_options, batch, nullptr, nullptr, nullptr,
+                          no_log_ref, !DISABLE_MEMTABLE, &seq_used, batch_cnt,
                           pre_release_callback);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   uint64_t prepare_seq = seq_used;
@@ -240,8 +239,8 @@ Status WritePreparedTxnDB::WriteInternal(const WriteOptions& write_options_orig,
   write_options.sync = false;
   const size_t ONE_BATCH = 1;  // Just to inc the seq
   s = db_impl_->WriteImpl(write_options, &empty_batch, nullptr, nullptr,
-                          no_log_ref, DISABLE_MEMTABLE, &seq_used, ONE_BATCH,
-                          &update_commit_map_with_prepare);
+                          nullptr, no_log_ref, DISABLE_MEMTABLE, &seq_used,
+                          ONE_BATCH, &update_commit_map_with_prepare);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   // Note: RemovePrepared is called from within PreReleaseCallback
   return s;

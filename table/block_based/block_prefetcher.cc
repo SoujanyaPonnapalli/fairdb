@@ -18,6 +18,12 @@ void BlockPrefetcher::PrefetchIfNeeded(
     const bool no_sequential_checking, const ReadOptions& read_options,
     const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
     bool is_async_io_prefetch) {
+  if (read_options.read_tier == ReadTier::kBlockCacheTier) {
+    // Disable prefetching when IO disallowed. (Note that we haven't allocated
+    // any buffers yet despite the various tracked settings.)
+    return;
+  }
+
   ReadaheadParams readahead_params;
   readahead_params.initial_readahead_size = readahead_size;
   readahead_params.max_readahead_size = readahead_size;
@@ -33,7 +39,8 @@ void BlockPrefetcher::PrefetchIfNeeded(
         return;
       }
       IOOptions opts;
-      Status s = rep->file->PrepareIOOptions(read_options, opts);
+      IODebugContext dbg;
+      Status s = rep->file->PrepareIOOptions(read_options, opts, &dbg);
       if (!s.ok()) {
         return;
       }
@@ -52,9 +59,10 @@ void BlockPrefetcher::PrefetchIfNeeded(
     // implicit_auto_readahead is set.
     readahead_params.initial_readahead_size = compaction_readahead_size_;
     readahead_params.max_readahead_size = compaction_readahead_size_;
-    rep->CreateFilePrefetchBufferIfNotExists(readahead_params,
-                                             &prefetch_buffer_,
-                                             /*readaheadsize_cb=*/nullptr);
+    rep->CreateFilePrefetchBufferIfNotExists(
+        readahead_params, &prefetch_buffer_,
+        /*readaheadsize_cb=*/nullptr,
+        /*usage=*/FilePrefetchBufferUsage::kCompactionPrefetch);
     return;
   }
 

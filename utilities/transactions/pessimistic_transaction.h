@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -123,13 +122,6 @@ class PessimisticTransaction : public TransactionBaseImpl {
                      ColumnFamilyHandle* column_family = nullptr) override;
 
  protected:
-  // Refer to
-  // TransactionOptions::use_only_the_last_commit_time_batch_for_recovery
-  bool use_only_the_last_commit_time_batch_for_recovery_ = false;
-  // Refer to
-  // TransactionOptions::skip_prepare
-  bool skip_prepare_ = false;
-
   virtual Status PrepareInternal() = 0;
 
   virtual Status CommitWithoutPrepareInternal() = 0;
@@ -167,6 +159,18 @@ class PessimisticTransaction : public TransactionBaseImpl {
   // performed blind writes or Get, though.
   TxnTimestamp read_timestamp_{kMaxTxnTimestamp};
   TxnTimestamp commit_timestamp_{kMaxTxnTimestamp};
+
+  // Refer to
+  // TransactionOptions::use_only_the_last_commit_time_batch_for_recovery
+  bool use_only_the_last_commit_time_batch_for_recovery_ = false;
+  // Refer to
+  // TransactionOptions::skip_prepare
+  bool skip_prepare_ = false;
+  // Refer to TransactionOptions::commit_bypass_memtable
+  uint32_t commit_bypass_memtable_threshold_ =
+      std::numeric_limits<uint32_t>::max();
+  uint64_t commit_bypass_memtable_byte_threshold_ =
+      std::numeric_limits<uint64_t>::max();
 
  private:
   friend class TransactionTest_ValidateSnapshotTest_Test;
@@ -235,6 +239,11 @@ class WriteCommittedTxn : public PessimisticTransaction {
                       PinnableSlice* pinnable_val, bool exclusive,
                       const bool do_validate) override;
 
+  Status GetEntityForUpdate(const ReadOptions& read_options,
+                            ColumnFamilyHandle* column_family, const Slice& key,
+                            PinnableWideColumns* columns, bool exclusive,
+                            bool do_validate) override;
+
   using TransactionBaseImpl::Put;
   // `key` does NOT include timestamp even when it's enabled.
   Status Put(ColumnFamilyHandle* column_family, const Slice& key,
@@ -248,6 +257,25 @@ class WriteCommittedTxn : public PessimisticTransaction {
                       const Slice& value) override;
   Status PutUntracked(ColumnFamilyHandle* column_family, const SliceParts& key,
                       const SliceParts& value) override;
+
+  // `key` does NOT include timestamp even when it's enabled.
+  Status PutEntity(ColumnFamilyHandle* column_family, const Slice& key,
+                   const WideColumns& columns,
+                   bool assume_tracked = false) override {
+    const bool do_validate = !assume_tracked;
+
+    return PutEntityImpl(column_family, key, columns, do_validate,
+                         assume_tracked);
+  }
+
+  Status PutEntityUntracked(ColumnFamilyHandle* column_family, const Slice& key,
+                            const WideColumns& columns) override {
+    constexpr bool do_validate = false;
+    constexpr bool assume_tracked = false;
+
+    return PutEntityImpl(column_family, key, columns, do_validate,
+                         assume_tracked);
+  }
 
   using TransactionBaseImpl::Delete;
   // `key` does NOT include timestamp even when it's enabled.
@@ -288,6 +316,10 @@ class WriteCommittedTxn : public PessimisticTransaction {
                           TValue* value, bool exclusive,
                           const bool do_validate);
 
+  Status PutEntityImpl(ColumnFamilyHandle* column_family, const Slice& key,
+                       const WideColumns& columns, bool do_validate,
+                       bool assume_tracked);
+
   template <typename TKey, typename TOperation>
   Status Operate(ColumnFamilyHandle* column_family, const TKey& key,
                  const bool do_validate, const bool assume_tracked,
@@ -302,6 +334,11 @@ class WriteCommittedTxn : public PessimisticTransaction {
   Status CommitInternal() override;
 
   Status RollbackInternal() override;
+
+  // Checks if the combination of `do_validate`, the read timestamp set in
+  // `read_timestamp_` and the `enable_udt_validation` flag in
+  // TransactionDBOptions make sense together.
+  Status SanityCheckReadTimestamp(bool do_validate);
 
   // Column families that enable timestamps and whose data are written when
   // indexing_enabled_ is false. If a key is written when indexing_enabled_ is

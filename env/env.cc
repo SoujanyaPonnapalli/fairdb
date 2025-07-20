@@ -355,6 +355,12 @@ class LegacyDirectoryWrapper : public FSDirectory {
   std::unique_ptr<Directory> target_;
 };
 
+// A helper class to make legacy `Env` implementations be backward compatible
+// now that all `Env` implementations are expected to have a `FileSystem` type
+// member `file_system_` and a `SystemClock` type member `clock_`.
+// This class wraps a legacy `Env` object and expose its file system related
+// APIs as a `FileSystem` interface. Also check `LegacySystemClock` that does
+// the same thing for the clock related APIs.
 class LegacyFileSystemWrapper : public FileSystem {
  public:
   // Initialize an EnvWrapper that delegates all calls to *t
@@ -605,6 +611,7 @@ class LegacyFileSystemWrapper : public FileSystem {
     // would be part of the Env.  As such, do not serialize it here.
     return "";
   }
+
  private:
   Env* target_;
 };
@@ -725,6 +732,37 @@ std::string Env::PriorityToString(Env::Priority priority) {
   return "Invalid";
 }
 
+std::string Env::IOActivityToString(IOActivity activity) {
+  switch (activity) {
+    case Env::IOActivity::kFlush:
+      return "Flush";
+    case Env::IOActivity::kCompaction:
+      return "Compaction";
+    case Env::IOActivity::kDBOpen:
+      return "DBOpen";
+    case Env::IOActivity::kGet:
+      return "Get";
+    case Env::IOActivity::kMultiGet:
+      return "MultiGet";
+    case Env::IOActivity::kDBIterator:
+      return "DBIterator";
+    case Env::IOActivity::kVerifyDBChecksum:
+      return "VerifyDBChecksum";
+    case Env::IOActivity::kVerifyFileChecksums:
+      return "VerifyFileChecksums";
+    case Env::IOActivity::kGetEntity:
+      return "GetEntity";
+    case Env::IOActivity::kMultiGetEntity:
+      return "MultiGetEntity";
+    case Env::IOActivity::kGetFileChecksumsFromCurrentManifest:
+      return "GetFileChecksumsFromCurrentManifest";
+    case Env::IOActivity::kUnknown:
+      return "Unknown";
+  };
+  assert(false);
+  return "Invalid";
+}
+
 uint64_t Env::GetThreadID() const {
   std::hash<std::thread::id> hasher;
   return hasher(std::this_thread::get_id());
@@ -824,6 +862,15 @@ RandomAccessFile::~RandomAccessFile() = default;
 WritableFile::~WritableFile() = default;
 
 MemoryMappedFileBuffer::~MemoryMappedFileBuffer() = default;
+
+// This const variable can be used in public headers without introducing the
+// possibility of ODR violations due to varying macro definitions.
+const InfoLogLevel Logger::kDefaultLogLevel =
+#ifdef NDEBUG
+    INFO_LEVEL;
+#else
+    DEBUG_LEVEL;
+#endif  // NDEBUG
 
 Logger::~Logger() = default;
 
@@ -1071,8 +1118,6 @@ void AssignEnvOptions(EnvOptions* env_options, const DBOptions& options) {
   env_options->set_fd_cloexec = options.is_fd_close_on_exec;
   env_options->bytes_per_sync = options.bytes_per_sync;
   env_options->compaction_readahead_size = options.compaction_readahead_size;
-  env_options->random_access_max_buffer_size =
-      options.random_access_max_buffer_size;
   env_options->rate_limiter = options.rate_limiter.get();
   env_options->writable_file_max_buffer_size =
       options.writable_file_max_buffer_size;

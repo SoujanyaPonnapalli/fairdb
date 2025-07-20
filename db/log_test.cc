@@ -129,7 +129,8 @@ class LogTest
     std::string message_;
 
     ReportCollector() : dropped_bytes_(0) {}
-    void Corruption(size_t bytes, const Status& status) override {
+    void Corruption(size_t bytes, const Status& status,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       dropped_bytes_ += bytes;
       message_.append(status.ToString());
     }
@@ -436,6 +437,17 @@ TEST_P(LogTest, BadRecordType) {
   ASSERT_EQ("OK", MatchError("unknown record type"));
 }
 
+TEST_P(LogTest, IgnorableRecordType) {
+  Write("foo");
+  // Type is stored in header[6]
+  SetByte(6, static_cast<char>(kRecordTypeSafeIgnoreMask + 100));
+  FixChecksum(0, 3, false);
+  ASSERT_EQ("EOF", Read());
+  // The new type has value 129 and masked to be ignorable if unknown
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
 TEST_P(LogTest, TruncatedTrailingRecordIsIgnored) {
   Write("foo");
   ShrinkSize(4);  // Drop all payload as well as a header byte
@@ -454,7 +466,7 @@ TEST_P(LogTest, TruncatedTrailingRecordIsNotIgnored) {
   Write("foo");
   ShrinkSize(4);  // Drop all payload as well as a header byte
   ASSERT_EQ("EOF", Read(WALRecoveryMode::kAbsoluteConsistency));
-  // Truncated last record is ignored, not treated as an error
+  // Truncated last record is not ignored, treated as an error
   ASSERT_GT(DroppedBytes(), 0U);
   ASSERT_EQ("OK", MatchError("Corruption: truncated header"));
 }
@@ -774,6 +786,32 @@ TEST_P(LogTest, RecycleWithTimestampSize) {
   ASSERT_EQ("EOF", Read());
 }
 
+// Validates that `MaybeAddUserDefinedTimestampSizeRecord`` adds padding to the
+// tail of a block and switches to a new block, if there's not enough space for
+// the record.
+TEST_P(LogTest, TimestampSizeRecordPadding) {
+  bool recyclable_log = (std::get<0>(GetParam()) != 0);
+  const size_t header_size =
+      recyclable_log ? kRecyclableHeaderSize : kHeaderSize;
+  const size_t data_len = kBlockSize - 2 * header_size;
+
+  const auto first_str = BigString("foo", data_len);
+  Write(first_str);
+
+  UnorderedMap<uint32_t, size_t> ts_sz = {
+      {2, sizeof(uint64_t)},
+  };
+  ASSERT_OK(
+      writer_->MaybeAddUserDefinedTimestampSizeRecord(WriteOptions(), ts_sz));
+  ASSERT_LT(writer_->TEST_block_offset(), kBlockSize);
+
+  const auto second_str = BigString("bar", 1000);
+  Write(second_str);
+
+  ASSERT_EQ(first_str, Read());
+  CheckRecordAndTimestampSize(second_str, ts_sz);
+}
+
 // Do NOT enable compression for this instantiation.
 INSTANTIATE_TEST_CASE_P(
     Log, LogTest,
@@ -788,7 +826,8 @@ class RetriableLogTest : public ::testing::TestWithParam<int> {
     std::string message_;
 
     ReportCollector() : dropped_bytes_(0) {}
-    void Corruption(size_t bytes, const Status& status) override {
+    void Corruption(size_t bytes, const Status& status,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       dropped_bytes_ += bytes;
       message_.append(status.ToString());
     }
@@ -1129,6 +1168,42 @@ TEST_P(CompressionLogTest, AlignedFragmentation) {
     ASSERT_EQ(wal_entry, Read());
   }
   ASSERT_EQ("EOF", Read());
+}
+
+TEST_P(CompressionLogTest, ChecksumMismatch) {
+  const CompressionType kCompressionType = std::get<2>(GetParam());
+  const bool kCompressionEnabled = kCompressionType != kNoCompression;
+  const bool kRecyclableLog = (std::get<0>(GetParam()) != 0);
+  if (!StreamingCompressionTypeSupported(kCompressionType)) {
+    ROCKSDB_GTEST_SKIP("Test requires support for compression type");
+    return;
+  }
+  ASSERT_OK(SetupTestEnv());
+
+  Write("foooooo");
+  int header_len;
+  if (kRecyclableLog) {
+    header_len = kRecyclableHeaderSize;
+  } else {
+    header_len = kHeaderSize;
+  }
+  int compression_record_len;
+  if (kCompressionEnabled) {
+    compression_record_len = header_len + 4;
+  } else {
+    compression_record_len = 0;
+  }
+  IncrementByte(compression_record_len + header_len /* offset */,
+                14 /* delta */);
+
+  ASSERT_EQ("EOF", Read());
+  if (!kRecyclableLog) {
+    ASSERT_GT(DroppedBytes(), 0U);
+    ASSERT_EQ("OK", MatchError("checksum mismatch"));
+  } else {
+    ASSERT_EQ(0U, DroppedBytes());
+    ASSERT_EQ("", ReportMessage());
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(

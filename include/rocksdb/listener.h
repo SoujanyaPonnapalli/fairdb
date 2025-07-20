@@ -183,6 +183,8 @@ enum class FlushReason : int {
   kWalFull = 0xd,
   // SwitchMemtable will not be called for this flush reason.
   kCatchUpAfterErrorRecovery = 0xe,
+
+  // When adding flush reason, make sure to also add it to FlushReason in Java.
 };
 
 const char* GetFlushReasonString(FlushReason flush_reason);
@@ -210,7 +212,6 @@ struct WriteStallInfo {
     WriteStallCondition prev;
   } condition;
 };
-
 
 struct FileDeletionInfo {
   FileDeletionInfo() = default;
@@ -328,6 +329,15 @@ struct BlobFileGarbageInfo : public BlobFileInfo {
   uint64_t garbage_blob_bytes;
 };
 
+struct ManualFlushInfo {
+  // the id of the column family
+  uint32_t cf_id;
+  // the name of the column family
+  std::string cf_name;
+  // Reason that triggered this manual flush
+  FlushReason flush_reason;
+};
+
 struct FlushJobInfo {
   // the id of the column family
   uint32_t cf_id;
@@ -429,6 +439,9 @@ struct CompactionJobInfo {
   // the job id, which is unique in the same thread.
   int job_id;
 
+  // the number of L0 files in the CF right before and after the compaction
+  int num_l0_files;
+
   // the smallest input level of the compaction.
   int base_input_level;
   // the output level of the compaction.
@@ -492,6 +505,10 @@ struct MemTableInfo {
   uint64_t num_entries;
   // Total number of deletes in memtable
   uint64_t num_deletes;
+
+  // The newest user-defined timestamps in the memtable. Note this field is
+  // only populated when `persist_user_defined_timestamps` is false.
+  std::string newest_udt;
 };
 
 struct ExternalFileIngestionInfo {
@@ -594,6 +611,14 @@ class EventListener : public Customizable {
   // returns.  Otherwise, RocksDB may be blocked.
   virtual void OnFlushBegin(DB* /*db*/,
                             const FlushJobInfo& /*flush_job_info*/) {}
+
+  // A callback function to RocksDB which will be called after a manual flush
+  // is scheduled. The default implementation is no-op.
+  // The size of the `manual_flush_info` vector should only be bigger than 1 if
+  // the DB enables atomic flush and has more than 1 column families. Its size
+  // should be 1 in all other cases.
+  virtual void OnManualFlushScheduled(
+      DB* /*db*/, const std::vector<ManualFlushInfo>& /*manual_flush_info*/) {}
 
   // A callback function for RocksDB which will be called whenever
   // a SST file is deleted.  Different from OnCompactionCompleted and
@@ -843,6 +868,5 @@ class EventListener : public Customizable {
 
   ~EventListener() override {}
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <atomic>
 #include <condition_variable>
 #include <limits>
@@ -162,6 +161,9 @@ class BlobDBImpl : public BlobDB {
   Status GetLiveFiles(std::vector<std::string>&, uint64_t* manifest_file_size,
                       bool flush_memtable = true) override;
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData>*) override;
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files) override;
 
   ~BlobDBImpl();
 
@@ -506,6 +508,8 @@ class BlobDBImpl : public BlobDB {
 
   uint32_t debug_level_;
 };
+
+Decompressor& BlobDecompressor();
 
 }  // namespace blob_db
 }  // namespace ROCKSDB_NAMESPACE

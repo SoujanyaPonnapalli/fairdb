@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <iomanip>
 #include <string>
 #include <thread>
 
@@ -445,4 +446,3 @@ int main(int /*argc*/, char** /*argv*/) {
 }
 
 #endif  // OS_WIN
-
